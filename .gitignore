@@ -1,9 +1,28 @@
+# Python
 *.pyc
-data/
 __pycache__/
-checkpoints/
-*.pth
-*.jpg
 venv/
-.idea/
+.venv/
+
+# Datasets
+data/
+data_ISIC/
+data_carvana/
+*.jpg
+*.png
+
+# Training outputs
+checkpoints/
+results/
+*.pth
+
+# Experiment tracking
 wandb/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
