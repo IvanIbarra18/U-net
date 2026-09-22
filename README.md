@@ -13,17 +13,17 @@ Two segmentation datasets are used:
 - Carvana
 - ISIC 2016
 
+The project also evaluates the effect of image preprocessing and batch size on GPU memory usage and training performance.
+
 ## Experimental Configuration
 
-The baseline experiments use:
+The experiments use:
 
 - U-Net architecture
-- Image scale: 0.5
-- Batch size: 1
-- 100 training epochs
-- 10% validation split
 - RMSprop optimizer
 - Learning rate: 1e-5
+- 100 training epochs
+- 10% validation split
 
 Each precision configuration is evaluated using:
 
@@ -38,36 +38,43 @@ Each precision configuration is evaluated using:
 
 Datasets are not included in this repository.
 
+### Carvana
+
 Expected directory structure:
 
+```text
 Pytorch-UNet/
-├── train_experiment.py
+
+├── train.py
+├── preprocess_isic.py
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
+│
 ├── data_carvana/
 │   ├── imgs/
 │   └── masks/
-└── data_ISIC/
+│
+├── data_ISIC/
+│   ├── imgs/
+│   └── masks/
+│
+└── data_ISIC_processed/
     ├── imgs/
     └── masks/
-
-## Baseline Experiments
-
-The baseline experiments consist of running the same configuration using three floating-point precisions.
 
 ### ISIC
 
 | Precision | Command |
 |---|---|
-| FP32 | `python train_experiment.py --dataset ISIC --precision FP32 -e 100 -b 1` |
-| FP16 | `python train_experiment.py --dataset ISIC --precision FP16 -e 100 -b 1` |
-| BF16 | `python train_experiment.py --dataset ISIC --precision BF16 -e 100 -b 1` |
+| FP32 | `python train.py --dataset ISIC --precision FP32 -e 100 -b 1` |
+| FP16 | `python train.py --dataset ISIC --precision FP16 -e 100 -b 1` |
+| BF16 | `python train.py --dataset ISIC --precision BF16 -e 100 -b 1` |
 
 ### Carvana
 
 | Precision | Command |
 |---|---|
-| FP32 | `python train_experiment.py --dataset Carvana --precision FP32 -e 100 -b 1` |
-| FP16 | `python train_experiment.py --dataset Carvana --precision FP16 -e 100 -b 1` |
-| BF16 | `python train_experiment.py --dataset Carvana --precision BF16 -e 100 -b 1` |
+| FP32 | `python train.py --dataset Carvana --precision FP32 -e 100 -b 1` |
+| FP16 | `python train.py --dataset Carvana --precision FP16 -e 100 -b 1` |
+| BF16 | `python train.py --dataset Carvana --precision BF16 -e 100 -b 1` |

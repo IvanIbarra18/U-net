@@ -3,8 +3,14 @@ import csv
 import logging
 import os
 import random
+import subprocess
+import sys
 import time
 from pathlib import Path
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 import matplotlib.pyplot as plt
 import torch
@@ -12,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Sampler, random_split
 from tqdm import tqdm
 
 from unet import UNet
@@ -34,9 +40,80 @@ DATASETS = {
         "masks": Path("./data_ISIC/masks/"),
         "mask_suffix": "_Segmentation",
     },
+    "ISIC_processed": {
+        "images": Path("./data_ISIC_processed/imgs/"),
+        "masks": Path("./data_ISIC_processed/masks/"),
+        "mask_suffix": "_Segmentation",
+    },
 }
 
 SUPPORTED_PRECISIONS = ("FP32", "FP16", "BF16")
+
+
+def ensure_processed_dataset():
+    """
+    Ensure that data_ISIC_processed exists.
+
+    If the processed dataset is missing or empty, automatically run
+    preprocess_isic.py from the project root.
+    """
+
+    processed_dir = Path("./data_ISIC_processed")
+    images_dir = processed_dir / "imgs"
+    masks_dir = processed_dir / "masks"
+    preprocess_script = Path("./preprocess_isic.py")
+
+    images_exist = (
+        images_dir.exists()
+        and any(images_dir.iterdir())
+    )
+
+    masks_exist = (
+        masks_dir.exists()
+        and any(masks_dir.iterdir())
+    )
+
+    if images_exist and masks_exist:
+        logging.info(
+            "Found existing data_ISIC_processed. "
+            "Skipping preprocessing."
+        )
+        return
+
+    logging.info(
+        "data_ISIC_processed was not found or appears incomplete."
+    )
+
+    if not preprocess_script.exists():
+        raise FileNotFoundError(
+            "data_ISIC_processed is missing and "
+            "preprocess_isic.py was not found."
+        )
+
+    logging.info(
+        "Running preprocess_isic.py..."
+    )
+
+    subprocess.run(
+        [sys.executable, str(preprocess_script)],
+        check=True,
+    )
+
+    if not (
+        images_dir.exists()
+        and masks_dir.exists()
+        and any(images_dir.iterdir())
+        and any(masks_dir.iterdir())
+    ):
+        raise RuntimeError(
+            "preprocess_isic.py finished, but "
+            "data_ISIC_processed still appears to be incomplete."
+        )
+
+    logging.info(
+        "ISIC preprocessing completed successfully."
+    )
+
 
 
 def set_seed(seed):
@@ -55,15 +132,104 @@ def set_seed(seed):
 
 
 # ============================================================
-# Metrics
+# Distributed training helpers
 # ============================================================
 
-def calculate_metrics(model, loader, device, precision):
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    if is_distributed():
+        return dist.get_rank()
+    return 0
+
+
+def get_world_size():
+    if is_distributed():
+        return dist.get_world_size()
+    return 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """
+    Initialize Distributed Data Parallel when launched with
+    torch.distributed.launch.
+
+    Returns:
+        local_rank, device
+    """
+
+    if "LOCAL_RANK" not in os.environ:
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        return 0, device
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "DDP was requested, but CUDA is not available."
+        )
+
+    torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(
+        backend="nccl"
+    )
+
+    device = torch.device(
+        "cuda",
+        local_rank,
+    )
+
+    return local_rank, device
+
+
+def cleanup_distributed():
+    """Destroy the distributed process group."""
+
+    if is_distributed():
+        dist.barrier()
+        dist.destroy_process_group()
+
+class DistributedEvalSampler(Sampler):
+    """Distributed sampler for evaluation without duplicating samples."""
+
+    def __init__(self, dataset, num_replicas=None, rank=None):
+        self.dataset = dataset
+        self.num_replicas = num_replicas if num_replicas is not None else get_world_size()
+        self.rank = rank if rank is not None else get_rank()
+        self.indices = list(range(self.rank, len(dataset), self.num_replicas))
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
+# ============================================================
+# Metrics
+# ============================================================
+def calculate_metrics(
+    model,
+    loader,
+    device,
+    precision,
+):
     """
     Calculate Dice and IoU on the validation set.
 
-    For the binary segmentation experiments used here, class 1
-    is treated as the foreground class.
+    In distributed mode, metrics from all processes are
+    synchronized using all_reduce.
     """
 
     model.eval()
@@ -71,14 +237,19 @@ def calculate_metrics(model, loader, device, precision):
     if precision == "FP32":
         amp = False
         autocast_dtype = torch.float32
+
     elif precision == "FP16":
         amp = True
         autocast_dtype = torch.float16
+
     elif precision == "BF16":
         amp = True
         autocast_dtype = torch.bfloat16
+
     else:
-        raise ValueError(f"Unsupported precision: {precision}")
+        raise ValueError(
+            f"Unsupported precision: {precision}"
+        )
 
     total_dice = 0.0
     total_iou = 0.0
@@ -107,35 +278,81 @@ def calculate_metrics(model, loader, device, precision):
 
                 masks_pred = model(images)
 
-            # Binary segmentation with two output classes.
             pred_masks = masks_pred.argmax(dim=1)
 
-            # Foreground class = 1
-            pred_foreground = pred_masks == 1
-            true_foreground = true_masks == 1
+            valid = true_masks != 255
+
+            pred_foreground = (
+                (pred_masks == 1)
+                & valid
+            )
+
+            true_foreground = (
+                (true_masks == 1)
+                & valid
+            )
 
             intersection = (
-                pred_foreground & true_foreground
+                pred_foreground
+                & true_foreground
             ).sum().float()
 
-            pred_area = pred_foreground.sum().float()
-            true_area = true_foreground.sum().float()
+            pred_area = (
+                pred_foreground.sum().float()
+            )
 
-            union = pred_area + true_area - intersection
+            true_area = (
+                true_foreground.sum().float()
+            )
+
+            union = (
+                pred_area
+                + true_area
+                - intersection
+            )
 
             dice = (
                 (2.0 * intersection + 1e-8)
-                / (pred_area + true_area + 1e-8)
+                /
+                (pred_area + true_area + 1e-8)
             )
 
             iou = (
                 (intersection + 1e-8)
-                / (union + 1e-8)
+                /
+                (union + 1e-8)
             )
 
             total_dice += dice.item()
             total_iou += iou.item()
             num_batches += 1
+
+    # --------------------------------------------------------
+    # Synchronize validation metrics across GPUs
+    # --------------------------------------------------------
+
+    if is_distributed():
+
+        metrics = torch.tensor(
+            [
+                total_dice,
+                total_iou,
+                float(num_batches),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+
+        dist.all_reduce(
+            metrics,
+            op=dist.ReduceOp.SUM,
+        )
+
+        total_dice = metrics[0].item()
+        total_iou = metrics[1].item()
+        num_batches = int(
+            metrics[2].item()
+        )
 
     model.train()
 
@@ -262,6 +479,7 @@ def save_summary(
     dataset_name,
     precision,
     total_time,
+    experiment_name="default",
 ):
 
     best_dice_index = max(
@@ -270,6 +488,7 @@ def save_summary(
     )
 
     summary = {
+        "experiment": experiment_name,
         "dataset": dataset_name,
         "precision": precision,
         "epochs": len(history["epoch"]),
@@ -334,18 +553,23 @@ def train_model(
         device,
         dataset_name,
         precision,
+        experiment_name: str = "default",
         epochs: int = 5,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
-        img_scale: float = 0.5,
+        img_scale: float = 1.0,
         workers: int = 0,
         seed: int = 42,
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
+
+    # DDP wraps the real U-Net in model.module. Keep a reference to the
+    # underlying model for architecture attributes and checkpoint saving.
+    base_model = model.module if is_distributed() else model
 
     # --------------------------------------------------------
     # Precision configuration
@@ -378,31 +602,44 @@ def train_model(
 
     results_dir = (
         Path("./results")
+        / experiment_name
         / dataset_name
         / precision
     )
 
-    results_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if is_main_process():
+        results_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-    # Start each experiment with fresh CSV files.
-    for filename in [
-        "metrics.csv",
-        "summary.csv",
-    ]:
+        # Start each experiment with fresh CSV files.
+        for filename in [
+            "metrics.csv",
+            "summary.csv",
+        ]:
 
-        path = results_dir / filename
+            path = results_dir / filename
 
-        if path.exists():
-            path.unlink()
+            if path.exists():
+                path.unlink()
+
+    if is_distributed():
+        dist.barrier()
 
     # --------------------------------------------------------
     # Dataset
     # --------------------------------------------------------
 
     dataset_info = DATASETS[dataset_name]
+
+    # ISIC_processed has already been resized and padded to
+    # 1024x768 by preprocess_isic.py. Do not resize it again.
+    effective_img_scale = (
+        1.0
+        if dataset_name == "ISIC_processed"
+        else img_scale
+    )
 
     logging.info(
         f"Creating {dataset_name} dataset"
@@ -413,7 +650,7 @@ def train_model(
         dataset = CarvanaDataset(
             dataset_info["images"],
             dataset_info["masks"],
-            scale=img_scale,
+            scale=effective_img_scale,
         )
 
     else:
@@ -421,7 +658,7 @@ def train_model(
         dataset = BasicDataset(
             dataset_info["images"],
             dataset_info["masks"],
-            scale=img_scale,
+            scale=effective_img_scale,
             mask_suffix=dataset_info["mask_suffix"],
         )
 
@@ -466,40 +703,76 @@ def train_model(
         persistent_workers=(workers > 0),
     )
 
-    train_loader = DataLoader(
-        train_set,
-        shuffle=True,
-        generator=loader_generator,
-        **loader_args,
-    )
+    if is_distributed():
 
-    val_loader = DataLoader(
-        val_set,
-        shuffle=False,
-        **loader_args,
-    )
+        train_sampler = DistributedSampler(
+            train_set,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=True,
+        )
+
+        val_sampler = DistributedEvalSampler(
+            val_set,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+        )
+
+        train_loader = DataLoader(
+            train_set,
+            shuffle=False,
+            sampler=train_sampler,
+            **loader_args,
+        )
+
+        val_loader = DataLoader(
+            val_set,
+            shuffle=False,
+            sampler=val_sampler,
+            **loader_args,
+        )
+
+    else:
+
+        train_sampler = None
+
+        train_loader = DataLoader(
+            train_set,
+            shuffle=True,
+            generator=loader_generator,
+            **loader_args,
+        )
+
+        val_loader = DataLoader(
+            val_set,
+            shuffle=False,
+            **loader_args,
+        )
 
 
     # --------------------------------------------------------
     # Logging
     # --------------------------------------------------------
 
-    logging.info(
-        f"""Starting training:
-        Dataset:          {dataset_name}
-        Precision:        {precision}
-        Epochs:           {epochs}
-        Batch size:       {batch_size}
-        Learning rate:    {learning_rate}
-        Validation:       {val_percent * 100:.1f}%
-        Checkpoints:      {save_checkpoint}
-        Device:           {device}
-        Image scaling:    {img_scale}
-        Mixed Precision:  {amp}
-        Autocast dtype:   {autocast_dtype}
+    if is_main_process():
+        logging.info(
+            f"""Starting training:
+        Experiment:        {experiment_name}
+        Dataset:           {dataset_name}
+        Precision:         {precision}
+        Epochs:            {epochs}
+        Batch size/GPU:    {batch_size}
+        Global batch size: {batch_size * get_world_size()}
+        Learning rate:     {learning_rate}
+        Validation:        {val_percent * 100:.1f}%
+        Checkpoints:       {save_checkpoint}
+        Device:            {device}
+        Image scaling:     {effective_img_scale}
+        Mixed Precision:   {amp}
+        Autocast dtype:    {autocast_dtype}
         DataLoader workers: {workers}
         """
-    )
+        )
 
     # --------------------------------------------------------
     # Optimizer
@@ -510,7 +783,6 @@ def train_model(
         lr=learning_rate,
         weight_decay=weight_decay,
         momentum=momentum,
-        foreach=True,
     )
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -524,8 +796,8 @@ def train_model(
     # --------------------------------------------------------
 
     criterion = (
-        nn.CrossEntropyLoss()
-        if model.n_classes > 1
+        nn.CrossEntropyLoss(ignore_index=255)
+        if base_model.n_classes > 1
         else nn.BCEWithLogitsLoss()
     )
 
@@ -560,6 +832,9 @@ def train_model(
 
     for epoch in range(1, epochs + 1):
 
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         epoch_start_time = time.perf_counter()
 
         if torch.cuda.is_available():
@@ -568,16 +843,26 @@ def train_model(
 
         model.train()
 
-        epoch_loss = 0.0
+        epoch_loss_sum = 0.0
+        epoch_sample_count = 0
 
-        with tqdm(
-            total=n_train,
+        progress_total = (
+            len(train_sampler) * get_world_size()
+            if train_sampler is not None
+            else n_train
+        )
+
+        progress = tqdm(
+            total=progress_total,
             desc=(
                 f"{dataset_name} {precision} | "
                 f"Epoch {epoch}/{epochs}"
             ),
             unit="img",
-        ) as pbar:
+            disable=not is_main_process(),
+        )
+
+        with progress as pbar:
 
             for batch in train_loader:
 
@@ -585,8 +870,8 @@ def train_model(
 
                 true_masks = batch["mask"]
 
-                assert images.shape[1] == model.n_channels, \
-                    f"Network has been defined with {model.n_channels} input channels, " \
+                assert images.shape[1] == base_model.n_channels, \
+                    f"Network has been defined with {base_model.n_channels} input channels, " \
                     f"but loaded images have {images.shape[1]} channels."
 
                 images = images.to(
@@ -612,7 +897,7 @@ def train_model(
 
                     masks_pred = model(images)
 
-                    if model.n_classes == 1:
+                    if base_model.n_classes == 1:
 
                         probabilities = torch.sigmoid(
                             masks_pred.squeeze(1)
@@ -638,7 +923,7 @@ def train_model(
                         loss += dice_loss_multiclass(
                             masks_pred,
                             true_masks,
-                            model.n_classes,
+                            base_model.n_classes,
                         )
 
                 # ------------------------------------------------
@@ -666,22 +951,45 @@ def train_model(
                 # Logging
                 # ------------------------------------------------
 
+                local_batch_size = images.shape[0]
+
                 pbar.update(
-                    images.shape[0]
+                    local_batch_size * get_world_size()
+                    if is_distributed()
+                    else local_batch_size
                 )
 
-                epoch_loss += loss.item()
+                epoch_loss_sum += loss.item() * local_batch_size
+                epoch_sample_count += local_batch_size
 
-                pbar.set_postfix(
-                    loss=f"{loss.item():.6f}"
-                )
+                if is_main_process():
+                    pbar.set_postfix(
+                        loss=f"{loss.item():.6f}"
+                    )
 
         # --------------------------------------------------------
         # Epoch metrics
         # --------------------------------------------------------
 
+        loss_stats = torch.tensor(
+            [epoch_loss_sum, float(epoch_sample_count)],
+            dtype=torch.float64,
+            device=device,
+        )
+
+        if is_distributed():
+            dist.all_reduce(
+                loss_stats,
+                op=dist.ReduceOp.SUM,
+            )
+
+        global_loss_sum = loss_stats[0].item()
+        global_sample_count = loss_stats[1].item()
+
         avg_train_loss = (
-            epoch_loss / len(train_loader)
+            global_loss_sum / global_sample_count
+            if global_sample_count > 0
+            else 0.0
         )
 
         val_dice, val_iou = calculate_metrics(
@@ -699,25 +1007,36 @@ def train_model(
         )
 
         throughput = (
-            n_train / epoch_time
+            global_sample_count / epoch_time
             if epoch_time > 0
             else 0.0
         )
 
-        gpu_allocated, peak_vram = (
-            get_gpu_memory()
-        )
+        gpu_allocated, peak_vram = get_gpu_memory()
 
         if torch.cuda.is_available():
-
             gpu_reserved = (
                 torch.cuda.max_memory_reserved()
                 / (1024 ** 3)
             )
-
         else:
-
             gpu_reserved = 0.0
+
+        if is_distributed():
+            memory_stats = torch.tensor(
+                [gpu_allocated, peak_vram, gpu_reserved],
+                dtype=torch.float64,
+                device=device,
+            )
+
+            dist.all_reduce(
+                memory_stats,
+                op=dist.ReduceOp.MAX,
+            )
+
+            gpu_allocated = memory_stats[0].item()
+            peak_vram = memory_stats[1].item()
+            gpu_reserved = memory_stats[2].item()
 
         current_lr = (
             optimizer.param_groups[0]["lr"]
@@ -769,20 +1088,21 @@ def train_model(
         # Save CSV after every epoch
         # --------------------------------------------------------
 
-        save_metrics_csv(
-            history,
-            results_dir,
-        )
-
+        if is_main_process():
+            save_metrics_csv(
+                history,
+                results_dir,
+            )
 
         # --------------------------------------------------------
         # Checkpoint
         # --------------------------------------------------------
 
-        if save_checkpoint:
+        if save_checkpoint and is_main_process():
 
             checkpoint_dir = (
                 Path("./checkpoints")
+                / experiment_name
                 / dataset_name
                 / precision
             )
@@ -792,7 +1112,7 @@ def train_model(
                 exist_ok=True,
             )
 
-            state_dict = model.state_dict()
+            state_dict = base_model.state_dict()
 
             state_dict["mask_values"] = (
                 dataset.mask_values
@@ -822,33 +1142,35 @@ def train_model(
         - total_start_time
     )
 
-    save_metrics_csv(
-        history,
-        results_dir,
-    )
+    if is_main_process():
+        save_metrics_csv(
+            history,
+            results_dir,
+        )
 
-    save_summary(
-        history,
-        results_dir,
-        dataset_name,
-        precision,
-        total_time,
-    )
+        save_summary(
+            history,
+            results_dir,
+            dataset_name,
+            precision,
+            total_time,
+            experiment_name,
+        )
 
-    save_plots(
-        history,
-        results_dir,
-    )
+        save_plots(
+            history,
+            results_dir,
+        )
 
-    logging.info(
-        f"Training completed in "
-        f"{total_time / 60:.2f} minutes"
-    )
+        logging.info(
+            f"Training completed in "
+            f"{total_time / 60:.2f} minutes"
+        )
 
-    logging.info(
-        f"Results saved to: "
-        f"{results_dir}"
-    )
+        logging.info(
+            f"Results saved to: "
+            f"{results_dir}"
+        )
 
 
 # ============================================================
@@ -887,14 +1209,22 @@ def dice_loss_multiclass(
     true_masks,
     num_classes,
 ):
-
     probabilities = F.softmax(
         logits,
         dim=1,
     )
 
+    # Processed ISIC masks use raw value 254 for artificial padding.
+    # BasicDataset converts raw 254 to tensor value 255 (ignore_index).
+    valid = true_masks != 255
+
+    safe_masks = true_masks.clamp(
+        min=0,
+        max=num_classes - 1,
+    )
+
     true_one_hot = F.one_hot(
-        true_masks,
+        safe_masks,
         num_classes,
     ).permute(
         0,
@@ -902,6 +1232,11 @@ def dice_loss_multiclass(
         1,
         2,
     ).float()
+
+    valid = valid.unsqueeze(1)
+
+    probabilities = probabilities * valid
+    true_one_hot = true_one_hot * valid
 
     smooth = 1e-6
 
@@ -933,7 +1268,7 @@ def get_args():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train U-Net on Carvana or ISIC "
+            "Train U-Net on Carvana, ISIC, or ISIC_processed "
             "using FP32, FP16, or BF16"
         )
     )
@@ -941,9 +1276,19 @@ def get_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["Carvana", "ISIC"],
+        choices=["Carvana", "ISIC", "ISIC_processed"],
         default="Carvana",
         help="Dataset to use",
+    )
+
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        default="default",
+        help=(
+            "Experiment name used to separate results and checkpoints. "
+            "Example: carvana_vs_isic_processed"
+        ),
     )
 
     parser.add_argument(
@@ -987,7 +1332,7 @@ def get_args():
         "--scale",
         "-s",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Downscaling factor of the images",
     )
 
@@ -1066,21 +1411,61 @@ if __name__ == "__main__":
         format="%(levelname)s: %(message)s",
     )
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
+    # --------------------------------------------------------
+    # Distributed setup
+    # --------------------------------------------------------
+
+    local_rank, device = setup_distributed()
+
+    rank = get_rank()
+    world_size = get_world_size()
+
+    # --------------------------------------------------------
+    # Dataset preprocessing
+    # --------------------------------------------------------
+
+    if args.dataset == "ISIC_processed":
+
+        if is_main_process():
+            ensure_processed_dataset()
+
+        if is_distributed():
+            dist.barrier()
+
+    # --------------------------------------------------------
+    # Reproducibility
+    # --------------------------------------------------------
+
+    set_seed(
+        args.seed + rank
     )
 
-    set_seed(args.seed)
+    if is_main_process():
 
-    logging.info(
-        f"Using device: {device}"
-    )
+        logging.info(
+            f"Using device: {device}"
+        )
 
-    logging.info(
-        f"Random seed: {args.seed}"
-    )
+        logging.info(
+            f"Experiment: {args.experiment}"
+        )
+
+        logging.info(
+            f"Random seed: {args.seed}"
+        )
+
+        logging.info(
+            f"Distributed training: "
+            f"{is_distributed()}"
+        )
+
+        logging.info(
+            f"World size: {world_size}"
+        )
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
 
     model = UNet(
         n_channels=3,
@@ -1092,17 +1477,19 @@ if __name__ == "__main__":
         memory_format=torch.channels_last
     )
 
-    logging.info(
-        f"Total parameters: "
-        f"{sum(p.numel() for p in model.parameters()):,}"
-    )
+    if is_main_process():
 
-    logging.info(
-        f"Network:\n"
-        f"\t{model.n_channels} input channels\n"
-        f"\t{model.n_classes} output channels\n"
-        f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling'
-    )
+        logging.info(
+            f"Total parameters: "
+            f"{sum(p.numel() for p in model.parameters()):,}"
+        )
+
+        logging.info(
+            f"Network:\n"
+            f"\t{model.n_channels} input channels\n"
+            f"\t{model.n_classes} output channels\n"
+            f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling'
+        )
 
     # --------------------------------------------------------
     # Load checkpoint
@@ -1118,31 +1505,60 @@ if __name__ == "__main__":
         if "mask_values" in state_dict:
             del state_dict["mask_values"]
 
+        # Allow loading checkpoints produced by an older DDP version
+        # that saved keys with the "module." prefix.
+        if any(key.startswith("module.") for key in state_dict):
+            state_dict = {
+                key.removeprefix("module."): value
+                for key, value in state_dict.items()
+            }
+
         model.load_state_dict(
             state_dict
         )
 
-        logging.info(
-            f"Model loaded from {args.load}"
-        )
+        if is_main_process():
+
+            logging.info(
+                f"Model loaded from {args.load}"
+            )
 
     model.to(device=device)
+
+    # --------------------------------------------------------
+    # DDP
+    # --------------------------------------------------------
+
+    if is_distributed():
+
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
 
     # --------------------------------------------------------
     # Train
     # --------------------------------------------------------
 
-    train_model(
-        model=model,
-        device=device,
-        dataset_name=args.dataset,
-        precision=args.precision,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        val_percent=args.val / 100,
-        save_checkpoint=not args.no_save,
-        img_scale=args.scale,
-        workers=args.workers,
-        seed=args.seed,
-    )
+    try:
+
+        train_model(
+            model=model,
+            device=device,
+            dataset_name=args.dataset,
+            precision=args.precision,
+            experiment_name=args.experiment,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            val_percent=args.val / 100,
+            save_checkpoint=not args.no_save,
+            img_scale=args.scale,
+            workers=args.workers,
+            seed=args.seed,
+        )
+
+    finally:
+
+        cleanup_distributed()
