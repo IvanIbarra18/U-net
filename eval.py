@@ -1,4 +1,6 @@
 
+import time
+
 import torch
 from tqdm import tqdm
 from utilis.metrics import dice_score
@@ -94,7 +96,7 @@ def log_validation_images(writer,images,masks,logits,epoch,max_images=4,threshol
         writer.add_image(f"Validation/Prediction_{index}",predicted_masks[index],epoch,)
 
 
-def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=False,use_tta=False,writer=None,max_tb_images=4,return_loss_components=False,):
+def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=False,use_tta=False,writer=None,max_tb_images=4,return_loss_components=False,collect_inference_timing=False,inference_warmup_batches=0,):
     """Evaluate a model and return average loss and Dice, with optional loss components."""
 
     model.eval()
@@ -107,6 +109,9 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
     dice_sum = torch.zeros((), device=device)
     samples_seen = 0
     images_logged = False
+    inference_seconds = 0.0
+    inference_samples = 0
+    timed_batch_start = min(inference_warmup_batches, max(len(dataloader) - 1, 0))
 
     with torch.no_grad():
         with tqdm(
@@ -126,10 +131,23 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
                     non_blocking=pin_memory,
                 )
 
+                if collect_inference_timing and device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                inference_start = (
+                    time.perf_counter() if collect_inference_timing else 0.0
+                )
+
                 if use_tta:
                     logits = predict_with_tta(model, images)
                 else:
                     logits = model(images)
+
+                if collect_inference_timing:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    if batch_idx >= timed_batch_start:
+                        inference_seconds += time.perf_counter() - inference_start
+                        inference_samples += images.size(0)
 
                 if return_loss_components:
                     loss, loss_components = criterion(
@@ -183,5 +201,18 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
         metrics.update({
             name: total.item() / samples_seen
             for name, total in component_sums.items()
+        })
+    if collect_inference_timing:
+        metrics.update({
+            "latency_ms_per_image": (
+                inference_seconds / inference_samples * 1000
+                if inference_samples
+                else None
+            ),
+            "throughput_images_per_sec": (
+                inference_samples / inference_seconds
+                if inference_seconds
+                else None
+            ),
         })
     return metrics

@@ -41,7 +41,7 @@ class UNetModern(nn.Module):
     Designed for binary segmentation with logits as output.
     """
 
-    def __init__(self,n_classes: int = 1,n_channels: int = 3,base_channels: int = 32,batch_norm: bool = True,) -> None:
+    def __init__(self,n_classes: int = 1,n_channels: int = 3,base_channels: int = 64,batch_norm: bool = True,) -> None:
         super().__init__()
 
         if n_classes < 1 or n_channels < 1 or base_channels < 1:

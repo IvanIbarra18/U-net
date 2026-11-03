@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ SUMMARY_FIELDS = (
     "model",
     "checkpoint",
     "checkpoint_epoch",
+    "total_params",
     "model_dtype",
     "autocast",
     "samples",
@@ -45,7 +47,14 @@ SUMMARY_FIELDS = (
     "peak_gpu_allocated_mib",
     "peak_gpu_reserved_mib",
 )
-PER_SAMPLE_FIELDS = ("sample_id", "loss", *LOSS_COMPONENTS, "dice")
+PER_SAMPLE_FIELDS = (
+    "sample_id",
+    "model",
+    "total_params",
+    "loss",
+    *LOSS_COMPONENTS,
+    "dice",
+)
 
 
 def split_arg(value):
@@ -61,6 +70,52 @@ def split_arg(value):
     return index
 
 
+def append_summary_row(summary_path, row):
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not summary_path.exists() or summary_path.stat().st_size == 0
+    if not write_header:
+        with summary_path.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            existing_fields = reader.fieldnames
+            existing_rows = list(reader)
+        if existing_fields != list(SUMMARY_FIELDS):
+            if (
+                existing_fields is None
+                or not set(existing_fields).issubset(SUMMARY_FIELDS)
+            ):
+                raise ValueError(
+                    f"CSV at {summary_path} has columns incompatible with "
+                    "the current evaluation summary."
+                )
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    newline="",
+                    encoding="utf-8",
+                    dir=summary_path.parent,
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    writer = csv.DictWriter(
+                        temporary_file,
+                        fieldnames=SUMMARY_FIELDS,
+                    )
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                temporary_path.replace(summary_path)
+            finally:
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
+
+    with summary_path.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=SUMMARY_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a trained U-Net segmentation model.")
     parser.add_argument("--dataset",required=True,choices=["Carvana", "ISBI", "ISIC"],)
@@ -69,6 +124,7 @@ def parse_args():
     parser.add_argument("--seed",type=int,default=None,help="Seed of the random split (default: the checkpoint's training seed, else 42).",)
     parser.add_argument("--validation","-v",type=float,default=None,help="Validation percentage of the random split (default: the checkpoint's value, else 10).",)
     parser.add_argument("--model",choices=["modern", "classic"],default="modern",help="Architecture used to train the checkpoint.",)
+    parser.add_argument("--base-channels",type=int,default=64,help="Base channel count used by the selected U-Net (default: 64).",)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers",type=int,default=min(4, os.cpu_count() or 1),help="DataLoader worker processes (default: min(4, CPU count)).",)
     parser.add_argument("--precision",type=str.upper,choices=["FP32", "FP16", "BF16"],default="FP32",help="Autocast (mixed precision) for inference; weights stay in their original dtype.",)
@@ -80,6 +136,8 @@ def parse_args():
 
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.base_channels < 1:
+        parser.error("--base-channels must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
     if args.validation is not None and not 0 < args.validation < 100:
@@ -174,10 +232,8 @@ def main():
             else f"random_seed{seed}_val{validation:g}"
         )
 
-    dataset = Subset(
-        PairTransformDataset(base_dataset, transform=None),
-        sample_indices,
-    )
+    dataset = Subset(PairTransformDataset(base_dataset, transform=None),sample_indices,)
+
     sample_ids = [base_dataset.ids[index] for index in sample_indices]
 
     loader_options = {
@@ -198,17 +254,19 @@ def main():
         model = UNetClassic(
             1,
             n_channels=input_channels,
+            base_channels=args.base_channels,
         ).to(device)
     else:
         model = UNetModern(
             n_classes=1,
             n_channels=input_channels,
-            base_channels=64,
+            base_channels=args.base_channels,
             batch_norm=True,
         ).to(device)
 
     # Load the FP32 weights first, then convert the model if requested.
     model.load_state_dict(state_dict)
+    total_params = sum(parameter.numel() for parameter in model.parameters())
 
     if args.cast is not None:
         model = model.to(device=device, dtype=CAST_DTYPES[args.cast])
@@ -308,12 +366,9 @@ def main():
 
     mean_loss = sample_mean("loss")
     mean_dice = sample_mean("dice")
-    latency_ms = (
-        timed_seconds / timed_samples * 1000 if timed_samples else float("nan")
-    )
-    throughput = (
-        timed_samples / timed_seconds if timed_seconds > 0 else float("nan")
-    )
+    latency_ms = (timed_seconds / timed_samples * 1000 if timed_samples else float("nan"))
+    throughput = (timed_samples / timed_seconds if timed_seconds > 0 else float("nan"))
+
     model_format = {
         torch.float32: "FP32",
         torch.float16: "FP16",
@@ -350,32 +405,28 @@ def main():
     # 1. One row per run in a shared summary, to compare runs side by side.
     args.output.mkdir(parents=True, exist_ok=True)
     summary_path = args.output / "summary.csv"
-    write_header = not summary_path.exists() or summary_path.stat().st_size == 0
-    with summary_path.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=SUMMARY_FIELDS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow({
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "dataset": args.dataset,
-            "split": split_name,
-            "model": args.model,
-            "checkpoint": str(args.checkpoint),
-            "checkpoint_epoch": (
-                checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
-            ),
-            "model_dtype": model_format,
-            "autocast": args.precision if use_amp else "off",
-            "samples": total_samples,
-            "mean_loss": mean_loss,
-            **{f"mean_{name}": sample_mean(name) for name in LOSS_COMPONENTS},
-            "mean_dice": mean_dice,
-            "latency_ms_per_image": latency_ms,
-            "throughput_images_per_sec": throughput,
-            "weights_mib": weights_mib,
-            "peak_gpu_allocated_mib": peak_allocated,
-            "peak_gpu_reserved_mib": peak_reserved,
-        })
+    append_summary_row(summary_path, {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "dataset": args.dataset,
+        "split": split_name,
+        "model": args.model,
+        "checkpoint": str(args.checkpoint),
+        "checkpoint_epoch": (
+            checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
+        ),
+        "total_params": total_params,
+        "model_dtype": model_format,
+        "autocast": args.precision if use_amp else "off",
+        "samples": total_samples,
+        "mean_loss": mean_loss,
+        **{f"mean_{name}": sample_mean(name) for name in LOSS_COMPONENTS},
+        "mean_dice": mean_dice,
+        "latency_ms_per_image": latency_ms,
+        "throughput_images_per_sec": throughput,
+        "weights_mib": weights_mib,
+        "peak_gpu_allocated_mib": peak_allocated,
+        "peak_gpu_reserved_mib": peak_reserved,
+    })
 
     # 2. Per-sample results of this run, for paired comparisons between
     # precisions on exactly the same images (overwritten on reruns).
@@ -387,11 +438,17 @@ def main():
     with per_sample_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=PER_SAMPLE_FIELDS)
         writer.writeheader()
-        writer.writerows(per_sample_rows)
+        writer.writerows(
+            {
+                **row,
+                "model": args.model,
+                "total_params": total_params,
+            }
+            for row in per_sample_rows
+        )
 
     print(f"Summary appended to: {summary_path}")
     print(f"Per-sample results saved to: {per_sample_path}")
-
 
 if __name__ == "__main__":
     main()

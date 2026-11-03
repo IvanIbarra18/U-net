@@ -54,8 +54,10 @@ class BackgroundPrefetchDataLoader(DataLoader):
 def parse_args():
     parser = argparse.ArgumentParser(description="Prepare segmentation data for U-Net training.")
     parser.add_argument("--dataset",required=True,choices=["Carvana", "ISBI", "ISIC"],help="Dataset name inside ./datasets/",)
+    parser.add_argument("--model",choices=["modern", "classic"],default="modern",help="U-Net architecture to train.",)
+    parser.add_argument("--base-channels",type=int,default=64,help="Base channel count for the selected U-Net (default: 64).",)
     parser.add_argument("--batch-size", "-b", type=int, default=3)
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',help='number of epochs to train (default: 10)')
+    parser.add_argument("--epochs", type=int, default=10, metavar='N',help='number of epochs to train (default: 10)')
     parser.add_argument("--num-workers", "-j", type=int, default=min(4, os.cpu_count() or 1),help="DataLoader worker processes (default: min(4, CPU count)).",)
     parser.add_argument("--validation","-v",type=float,default=10.0,help="Percentage of samples reserved for validation (0-100).",)
     parser.add_argument("--precision",type=lambda value: value.upper(),choices=["FP32", "FP16", "BF16"],default="FP32",help="Requested training precision; AMP will be used in the training loop.",)
@@ -72,6 +74,8 @@ def parse_args():
 
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.base_channels < 1:
+        parser.error("--base-channels must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
     if not 0 <= args.validation < 100:
@@ -202,10 +206,25 @@ def main():
     input_channels = 1 if args.dataset == "ISBI" else 3
 
 
-    """Select a model """
-    # 7. Create the U-Net using one-output-channel setup.
-    # model = UNetClassic(1, n_channels=input_channels).to(device)
-    model = UNetModern(n_classes=1,n_channels=input_channels,base_channels=64,batch_norm=True,).to(device)
+    # Create the selected U-Net using a one-output-channel setup.
+    if args.model == "classic":
+        model = UNetClassic(
+            1,
+            n_channels=input_channels,
+            base_channels=args.base_channels,
+        ).to(device)
+    else:
+        model = UNetModern(
+            n_classes=1,
+            n_channels=input_channels,
+            base_channels=args.base_channels,
+            batch_norm=True,
+        ).to(device)
+
+    weights_mib = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in list(model.parameters()) + list(model.buffers())
+    ) / (1024 ** 2)
 
 
 
@@ -372,11 +391,23 @@ def main():
             use_tta=False,
             writer=writer,
             return_loss_components=experiment_csv is not None,
+            collect_inference_timing=experiment_csv is not None,
+            inference_warmup_batches=3,
         )
 
         avg_val_loss = val_metrics["loss"]
         avg_val_dice = val_metrics["dice"]
         epoch_time_sec = time.perf_counter() - epoch_start_time
+        if device.type == "cuda":
+            peak_gpu_allocated_mib = (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            )
+            peak_gpu_reserved_mib = (
+                torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            )
+        else:
+            peak_gpu_allocated_mib = None
+            peak_gpu_reserved_mib = None
 
         history["train_loss"].append(avg_train_loss)
         history["train_dice"].append(avg_train_dice)
@@ -390,6 +421,8 @@ def main():
             }
             append_experiment_metrics(experiment_csv, {
                 "epoch": epoch,
+                "model": args.model,
+                "total_params": total_params,
                 "train_loss": avg_train_loss,
                 "train_bce_loss": avg_train_components["bce_loss"],
                 "train_dice_loss": avg_train_components["dice_loss"],
@@ -404,6 +437,11 @@ def main():
                 "val_dice_score": avg_val_dice,
                 "epoch_time_sec": epoch_time_sec,
                 "train_images_per_sec": train_performance["images_per_second"],
+                "latency_ms_per_image": val_metrics["latency_ms_per_image"],
+                "throughput_images_per_sec": val_metrics["throughput_images_per_sec"],
+                "weights_mib": weights_mib,
+                "peak_gpu_allocated_mib": peak_gpu_allocated_mib,
+                "peak_gpu_reserved_mib": peak_gpu_reserved_mib,
             })
 
         print(f"Epoch {epoch}/{args.epochs} complete | "
