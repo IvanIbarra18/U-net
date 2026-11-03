@@ -40,16 +40,26 @@ class UNetClassic(nn.Module):
     https://arxiv.org/pdf/1505.04597.pdf
     """
 
-    def __init__(self,n_classes: int,n_channels: int = 1,batch_norm: bool = False,) -> None:
+    def __init__(
+        self,
+        n_classes: int,
+        n_channels: int = 1,
+        batch_norm: bool = False,
+        base_channels: int = 64,
+    ) -> None:
         super().__init__()
 
-        if n_classes < 1 or n_channels < 1:
-            raise ValueError("n_classes and n_channels must be positive.")
+        if n_classes < 1 or n_channels < 1 or base_channels < 1:
+            raise ValueError(
+                "n_classes, n_channels, and base_channels must be positive."
+            )
 
         self.n_classes = n_classes
         self.n_channels = n_channels
         self.batch_norm = batch_norm
-        self.filter_sizes = [64, 128, 256, 512, 1024]
+        self.filter_sizes = [
+            base_channels * 2**level for level in range(5)
+        ]
 
         # Encoder: the first block does not use max pooling.
         encoder_blocks = []

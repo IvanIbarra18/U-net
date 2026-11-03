@@ -19,12 +19,10 @@ The `models/` directory contains two models:
   height and width and allows the base channel count and BatchNorm to be
   configured.
 
-Both models return logits for a binary mask. Currently, `train.py` creates the
-modern U-Net with 64 base channels and BatchNorm. The training architecture is
-selected in the `train.py` source code (the classic U-Net line is available as
-a commented alternative); training does not have a `--model` argument. To
-evaluate a checkpoint, `test.py` lets you choose the architecture with
-`--model modern` or `--model classic`.
+Both models return logits for a binary mask. `train.py` uses the modern U-Net
+with 64 base channels and BatchNorm by default. Choose either architecture with
+`--model modern` or `--model classic`; `--base-channels` configures the channel
+count of either model.
 
 ## Project structure
 
@@ -121,6 +119,8 @@ Run commands from the repository root. For example:
 python train.py --dataset ISBI --precision FP16 --epochs 50
 python train.py --dataset Carvana --precision FP32 --epochs 10
 python train.py --dataset ISIC --precision BF16 --epochs 10
+python train.py --dataset ISIC --model modern --base-channels 32
+python train.py --dataset ISIC --model classic --base-channels 32
 ```
 
 Training applies paired transforms to images and masks: random crops, elastic
@@ -147,6 +147,8 @@ python data/splits.py --dataset ISIC --folds 5 --validation 10 --seed 42
 | Argument | Default | Description |
 |---|---:|---|
 | `--dataset` | Required | `Carvana`, `ISBI`, or `ISIC` |
+| `--model` | `modern` | `modern` or `classic` |
+| `--base-channels` | `64` | Base channel count for the selected U-Net |
 | `--precision` | `FP32` | `FP32`, `FP16`, or `BF16` |
 | `--epochs` | `10` | Number of epochs |
 | `--batch-size` | `3` | Training batch size |
@@ -171,7 +173,9 @@ combines binary cross-entropy and soft Dice. The Dice score is calculated on
 the binary segmentation. When `--experiment-name` is set, the per-epoch CSV
 includes the training BCE and Dice losses, their weighted contributions to
 the total loss, the corresponding validation loss components, and the training
-and validation Dice scores.
+and validation Dice scores. It also records the model name and parameter count,
+validation forward latency and throughput, model weight size, and peak GPU
+memory use per epoch.
 
 ## Results and monitoring
 
@@ -183,8 +187,10 @@ and validation Dice scores.
   are saved under `checkpoints/tensorboard/<dataset>/`.
 - Enable a per-epoch summary CSV with `--experiment_name`. It is saved to
   `checkpoints/performance/<name>.csv` and includes training and validation
-  loss and Dice, epoch duration, and throughput in images per second. This CSV
-  is not generated if the argument is omitted.
+  loss and Dice, model name and parameter count, epoch duration, training
+  throughput, validation forward latency and throughput, model weight size,
+  and peak GPU memory. Validation latency excludes up to three warm-up batches.
+  This CSV is not generated if the argument is omitted.
 - `PerformanceLogger` also measures timing and memory usage during training.
 - When training finishes, `train.py` displays the loss and Dice curves for
   that run.
@@ -204,8 +210,11 @@ inference precision. For example:
 python test.py --dataset ISBI --checkpoint checkpoints/best_unet_ISBI_new.pth --model modern --split 0
 ```
 
-For a classic U-Net checkpoint, use `--model classic`. Results are saved to
-`test_results/` by default; change the directory with `--output`.
+For a classic U-Net checkpoint, use `--model classic`. If it was trained with
+a non-default channel count, pass the same value with `--base-channels`.
+The summary and per-sample CSVs include the model name and total parameter
+count. Results are saved to `test_results/` by default; change the directory
+with `--output`.
 `inference.py` contains prediction and evaluation utilities, including an
 option to average predictions from flipped inputs (test-time augmentation).
 

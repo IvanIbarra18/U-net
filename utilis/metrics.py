@@ -6,6 +6,8 @@ import torch
 
 EXPERIMENT_CSV_FIELDS = (
     "epoch",
+    "model",
+    "total_params",
     "train_loss",
     "train_bce_loss",
     "train_dice_loss",
@@ -20,6 +22,11 @@ EXPERIMENT_CSV_FIELDS = (
     "val_dice_score",
     "epoch_time_sec",
     "train_images_per_sec",
+    "latency_ms_per_image",
+    "throughput_images_per_sec",
+    "weights_mib",
+    "peak_gpu_allocated_mib",
+    "peak_gpu_reserved_mib",
 )
 
 
