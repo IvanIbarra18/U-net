@@ -29,6 +29,92 @@ EXPERIMENT_CSV_FIELDS = (
     "peak_gpu_reserved_mib",
 )
 
+EVALUATION_SUMMARY_FIELDS = (
+    "timestamp",
+    "dataset",
+    "split",
+    "model",
+    "checkpoint",
+    "checkpoint_epoch",
+    "total_params",
+    "model_dtype",
+    "autocast",
+    "tf32",
+    "quantization",
+    "act_calibration",
+    "calib_samples",
+    "fp_layers",
+    # What precision the run really had (see test.py describe_precision):
+    # values restricted to / stored in / computed in.
+    "backend",
+    "representation",
+    "storage",
+    "execution",
+    "samples",
+    "mean_loss",
+    "mean_bce_loss",
+    "mean_dice_loss",
+    "mean_bce_contribution",
+    "mean_dice_contribution",
+    "mean_dice",
+    "latency_ms_per_image",
+    "throughput_images_per_sec",
+    "weights_mib",
+    "engine_mib",
+    "peak_gpu_allocated_mib",
+    "peak_gpu_reserved_mib",
+    "gpu",
+    "driver",
+    "torch_version",
+    "tensorrt_version",
+)
+
+
+def append_summary_row(summary_path, row):
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not summary_path.exists() or summary_path.stat().st_size == 0
+    if not write_header:
+        with summary_path.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            existing_fields = reader.fieldnames
+            existing_rows = list(reader)
+        if existing_fields != list(EVALUATION_SUMMARY_FIELDS):
+            if (
+                existing_fields is None
+                or not set(existing_fields).issubset(EVALUATION_SUMMARY_FIELDS)
+            ):
+                raise ValueError(
+                    f"CSV at {summary_path} has columns incompatible with "
+                    "the current evaluation summary."
+                )
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    newline="",
+                    encoding="utf-8",
+                    dir=summary_path.parent,
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    writer = csv.DictWriter(
+                        temporary_file,
+                        fieldnames=EVALUATION_SUMMARY_FIELDS,
+                    )
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                temporary_path.replace(summary_path)
+            finally:
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
+
+    with summary_path.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=EVALUATION_SUMMARY_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 def append_experiment_metrics(csv_path, metrics):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
