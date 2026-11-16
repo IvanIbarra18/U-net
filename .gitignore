@@ -13,6 +13,7 @@ ENV/
 /runs/
 /checkpoints/
 /test_results/
+/exports/
 
 # Ignore other dataset archives, but keep the archive intended for upload.
 *.zip

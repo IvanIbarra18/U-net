@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--dataset",required=True,choices=["Carvana", "ISBI", "ISIC"],help="Dataset name inside ./datasets/",)
     parser.add_argument("--model",choices=["modern", "classic"],default="modern",help="U-Net architecture to train.",)
     parser.add_argument("--base-channels",type=int,default=64,help="Base channel count for the selected U-Net (default: 64).",)
-    parser.add_argument("--batch-size", "-b", type=int, default=3)
+    parser.add_argument("--batch-size", "-b", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=10, metavar='N',help='number of epochs to train (default: 10)')
     parser.add_argument("--num-workers", "-j", type=int, default=min(4, os.cpu_count() or 1),help="DataLoader worker processes (default: min(4, CPU count)).",)
     parser.add_argument("--validation","-v",type=float,default=10.0,help="Percentage of samples reserved for validation (0-100).",)
