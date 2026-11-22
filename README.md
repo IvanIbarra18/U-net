@@ -193,6 +193,7 @@ python data/splits.py --dataset ISIC --folds 5 --validation 10 --seed 42
 | `--base-channels` | `64` | Base channel count for the selected U-Net |
 | `--precision` | `FP32` | `FP32`, `FP16`, or `BF16` (AMP) |
 | `--cast` | None | `FP16` or `BF16`: whole model in 16 bits (experimental) |
+| `--tf32` | `off` | `on` allows TF32 in FP32 convolutions and matmuls (PyTorch's own default turns it on for convolutions) |
 | `--epochs` | `10` | Number of epochs |
 | `--batch-size` | `5` | Training batch size |
 | `--num-workers` | `min(4, CPU count)` | DataLoader worker processes |
