@@ -1,24 +1,30 @@
 """Activation calibration for simulated INT8 (Wu et al., 2020, Sec. 4.2).
 
-Weights are calibrated from the weights themselves (quantize_model.py).
-Activations depend on the input image, so their clipping threshold amax is
-estimated once, from representative TRAINING samples, and saved to JSON.
-test.py then reads that file (--calib-file) and picks a method (--act-calib).
+For weights, we find the range directly from the weights themselves
+(see quantize_model.py). Activations are different: they change with every
+input image. So we estimate their clipping threshold amax (the largest value
+we keep; bigger values are cut to amax) only once, using typical TRAINING
+images, and we save the result to a JSON file. Later, test.py reads that file
+(--calib-file) and chooses one method from it (--act-calib).
 
-What is observed: the INPUT of every Conv2d / ConvTranspose2d of the
-BN-folded FP32 model (weights not quantized, as in TensorRT and
-pytorch-quantization). One amax per layer: activations are per-tensor.
+What we watch: the INPUT of every Conv2d and ConvTranspose2d in the FP32
+model after BatchNorm folding. The weights are not quantized here, just like
+in TensorRT and pytorch-quantization. Each layer gets one amax, because
+activations are quantized per tensor.
 
-Two passes over the same images:
-    1. max pass        amax_max = max |x| per layer.
-    2. histogram pass  histogram of |x| with `bins` bins on [0, amax_max].
-From the histogram:
-    percentile-P  smallest amax that keeps P% of the values unclipped.
-    entropy       amax minimizing KL(P || Q) between the clipped reference
-                  distribution P and its 128-level quantized version Q
-                  (TensorRT's entropy calibrator, Migacz 2017).
-    entropy-skip-zeros  same, with the exact zeros removed from the
-                  histogram (our variant; see without_zeros()).
+We go over the same images two times:
+    1. max pass        amax_max = max |x| for each layer.
+    2. histogram pass  a histogram of |x| with `bins` bins on [0, amax_max].
+From the histogram we compute:
+    percentile-P  the smallest amax that keeps P% of the values below it
+                  (not clipped).
+    entropy       the amax that gives the smallest KL(P || Q). P is the
+                  clipped reference distribution and Q is its quantized
+                  version with 128 levels (TensorRT's entropy calibrator,
+                  Migacz 2017).
+    entropy-skip-zeros  the same as entropy, but we first remove the values
+                  that are exactly zero from the histogram (our own
+                  variant; see without_zeros()).
 
 Usage (from the repository root):
     python -m quantization.calibrate --dataset Carvana \
@@ -47,17 +53,17 @@ from utilis.checkpoint import load_checkpoint
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATASETS_DIR = ROOT_DIR / "datasets"
 PERCENTILES = (99.9, 99.99, 99.999)
-# torch.histc counts in FP32, exact only up to 2^24 per bin: feed it chunks
-# of at most this many elements and accumulate the counts in FP64.
+# torch.histc counts in FP32, which is exact only up to 2^24 per bin. So we
+# give it chunks of at most this many elements and add up the counts in FP64.
 HIST_CHUNK = 2 ** 24
 
 
 # ---------------------------------------------------------------------------
-# Threshold selection from a histogram of |x| (pure NumPy, unit tested).
+# Choosing the threshold from a histogram of |x| (only NumPy, with unit tests).
 # ---------------------------------------------------------------------------
 
 def amax_from_percentile(hist: np.ndarray, edges: np.ndarray, percentile: float) -> float:
-    """Upper edge of the bin where the CDF of |x| reaches `percentile`."""
+    """Return the upper edge of the bin where the CDF of |x| reaches `percentile`."""
     cdf = np.cumsum(hist) / hist.sum()
     index = int(np.searchsorted(cdf, percentile / 100.0))
     return float(edges[min(index + 1, len(edges) - 1)])
@@ -73,14 +79,17 @@ def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
 
 
 def amax_from_entropy(hist: np.ndarray, edges: np.ndarray, levels: int = QMAX + 1, start_bin: int = 128) -> tuple:
-    """TensorRT entropy calibration. For each candidate threshold bin i:
-        P = hist[:i], with all the mass beyond i (clipped values) added to
-            P[i-1]  -> the distribution we would actually feed the layer;
+    """TensorRT entropy calibration.
+
+    We try every possible threshold bin i and build two distributions:
+        P = hist[:i], and we add all the counts after bin i (the clipped
+            values) to P[i-1]. This is the data the layer would really get.
         Q = hist[:i] merged into `levels` groups (the INT8 levels; 128 for
-            non-negative data on [-127, 127]) and spread back uniformly over
-            the bins that are non-zero in P.
-    Clipping too much moves mass into P[i-1] that Q does not have; clipping
-    too little makes the 128 groups coarse. amax = upper edge of the best i.
+            non-negative data on [-127, 127]). Then each group's count is
+            spread back evenly over the bins that are not zero in P.
+    If we clip too much, P[i-1] gets a lot of extra counts that Q does not
+    have. If we clip too little, the 128 groups become too wide. We pick the
+    best i, and amax is the upper edge of that bin.
     Returns (amax, divergences).
     """
     hist = hist.astype(np.float64)
@@ -99,14 +108,14 @@ def amax_from_entropy(hist: np.ndarray, edges: np.ndarray, levels: int = QMAX + 
 
 
 def without_zeros(hist: np.ndarray, zeros: int) -> np.ndarray:
-    """Histogram with the exact zeros removed from bin 0.
+    """Return the histogram with the exact zeros removed from bin 0.
 
-    Variant of entropy calibration ("entropy-skip-zeros"), not in TensorRT's
-    original algorithm or in Wu et al. Rationale: after a ReLU 17-57% of the
-    values are exactly 0, which INT8 represents without error, yet that spike
-    dominates the KL divergence and drives entropy to clip 1-8% of the
-    nonzero values. Removing them makes the divergence measure only the
-    values that actually suffer quantization error.
+    This is a variant of entropy calibration ("entropy-skip-zeros"). It is not
+    part of TensorRT's original algorithm or of Wu et al. The reason: after a
+    ReLU, 17-57% of the values are exactly 0. INT8 can store 0 with no error,
+    but this big spike controls the KL divergence. Because of it, entropy
+    clips 1-8% of the nonzero values. When we remove the zeros, the divergence
+    only measures the values that really get a quantization error.
     """
     hist = hist.astype(np.float64).copy()
     hist[0] = max(hist[0] - zeros, 0.0)
@@ -114,24 +123,24 @@ def without_zeros(hist: np.ndarray, zeros: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Statistics collection with forward pre-hooks.
+# Collecting statistics with forward pre-hooks.
 # ---------------------------------------------------------------------------
 
 class InputObserver:
-    """Observes the input of one layer; never modifies it."""
+    """Watch the input of one layer. It never changes the input."""
 
     def __init__(self, bins: int):
         self.bins = bins
         self.amax = 0.0
         self.min = float("inf")
-        self.hist = None  # FP64 counts on the CPU
-        self.zeros = 0  # exact zeros (x == 0), all of them inside hist[0]
+        self.hist = None  # FP64 counts, kept on the CPU
+        self.zeros = 0  # number of exact zeros (x == 0); they all fall in hist[0]
         self.mode = "max"
 
     def __call__(self, module, args):
         x = args[0].detach()
         if self.mode == "max":
-            # max(|x|) = max(x.max(), -x.min()) without allocating |x|.
+            # max(|x|) = max(x.max(), -x.min()). This way we do not need memory for |x|.
             self.amax = max(self.amax, x.max().item(), -x.min().item())
             self.min = min(self.min, x.min().item())
         elif self.amax > 0:
@@ -157,7 +166,7 @@ def calibration_loader(args, train_args):
         base_dataset=base_dataset, dataset_name=args.dataset,
         split_index=train_args.get("split"), validation=validation, seed=seed,
     )
-    # A fixed random subset of the TRAINING part: never validation or test.
+    # A fixed random subset of the TRAINING images. We never use validation or test images.
     generator = torch.Generator().manual_seed(args.seed)
     order = torch.randperm(len(train_indices), generator=generator)[: args.samples]
     indices = [train_indices[i] for i in order.tolist()]
@@ -191,7 +200,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.allow_tf32 = False  # true FP32 statistics
+    torch.backends.cudnn.allow_tf32 = False  # we want real FP32 statistics
     torch.backends.cuda.matmul.allow_tf32 = False
 
     checkpoint = load_checkpoint(args.checkpoint, device)

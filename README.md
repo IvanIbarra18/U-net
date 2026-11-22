@@ -52,10 +52,13 @@ count of either model.
 │   ├── calibrate.py
 │   ├── env_report.py
 │   ├── export_onnx.py
+│   ├── formats.py
 │   ├── int8.py
+│   ├── modes.py
 │   ├── qdq_onnx.py
 │   ├── quantize_model.py
-│   ├── trt_engine.py
+│   └── trt_engine.py
+├── tests/                    # Unit tests (python -m unittest discover -s tests -t .)
 │   └── test_*.py
 ├── graphs/
 │   └── unet_architecture.png # Retained architecture diagram
@@ -67,6 +70,8 @@ count of either model.
 │   └── ISIC/
 ├── utilis/
 │   ├── checkpoint.py
+│   ├── evaluation.py
+│   ├── fp16_scaler.py
 │   ├── loss.py
 │   └── metrics.py
 ├── checkpoints/              # Generated checkpoints, TensorBoard logs, and CSVs
@@ -82,8 +87,8 @@ count of either model.
 └── train.py
 ```
 
-`data/`, `datasets/`, `splits/`, `models/`, `quantization/`, `profiling/`, and
-`utilis/` are separate directories. `calibration/`, `exports/`, and
+`data/`, `datasets/`, `splits/`, `models/`, `quantization/`, `tests/`,
+`profiling/`, and `utilis/` are separate directories. `calibration/`, `exports/`, and
 `test_results/` contain generated artifacts. Git ignores the extracted
 `datasets/` directory and `checkpoints/`, but does not ignore `datasets.zip`.
 The current archive is about 1.2 GB, so uploading it to GitHub requires Git LFS
@@ -186,7 +191,8 @@ python data/splits.py --dataset ISIC --folds 5 --validation 10 --seed 42
 | `--dataset` | Required | `Carvana`, `ISBI`, or `ISIC` |
 | `--model` | `modern` | `modern` or `classic` |
 | `--base-channels` | `64` | Base channel count for the selected U-Net |
-| `--precision` | `FP32` | `FP32`, `FP16`, or `BF16` |
+| `--precision` | `FP32` | `FP32`, `FP16`, or `BF16` (AMP) |
+| `--cast` | None | `FP16` or `BF16`: whole model in 16 bits (experimental) |
 | `--epochs` | `10` | Number of epochs |
 | `--batch-size` | `5` | Training batch size |
 | `--num-workers` | `min(4, CPU count)` | DataLoader worker processes |
@@ -205,7 +211,11 @@ python train.py --dataset ISBI --precision FP16 --epochs 50 --crop 256 384
 ```
 
 FP16 and BF16 use automatic mixed precision (AMP) when training on CUDA.
-FP16 also uses gradient scaling. On CPU, training runs without AMP. The loss
+FP16 also uses gradient scaling. `--cast BF16` or `--cast FP16` instead trains the whole
+model (weights, gradients, Adam state) in 16 bits, without FP32 master weights;
+`--cast FP16` adds dynamic loss scaling (`utilis/fp16_scaler.py`). Both are
+experimental: a one-epoch BF16 test trained normally, but the FP16 test
+diverged (NaN loss), which is still under investigation. On CPU, training runs without AMP. The loss
 combines binary cross-entropy and soft Dice. The Dice score is calculated on
 the binary segmentation. When `--experiment-name` is set, the per-epoch CSV
 includes the training BCE and Dice losses, their weighted contributions to
@@ -275,144 +285,201 @@ precision are also recorded.
 `inference.py` contains prediction and evaluation utilities, including an
 option to average predictions from flipped inputs (test-time augmentation).
 
-## Post-training quantization
+## Quantization
 
-The project has two different INT8 evaluation paths. They should not be
-interpreted as equivalent in terms of execution or speed.
+The goal is to measure how much numerical precision the U-Net can lose
+while keeping its segmentation quality. Every experiment states three
+properties separately, because they are not the same thing:
 
-### PyTorch fake quantization
+| Property | Question it answers |
+|---|---|
+| **Representation** | Which values are the numbers restricted to (e.g. the INT4 grid)? |
+| **Storage** | How are the weights actually held in memory? |
+| **Execution** | Which kernels actually computed the convolutions? |
 
-With `--backend pytorch --quant INT8`, `test.py` folds BatchNorm into
-convolutions and fake-quantizes the weights. Weights are symmetric and
-per-output-channel, with thresholds derived directly from the weights. By
-default this is W8A32: activations are not quantized.
+`summary.csv` has one column for each (`representation`, `storage`,
+`execution`), filled from the run itself (for TensorRT, from the built engine).
 
-```bash
-python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --quant INT8
+### Two evaluation paths
+
+| | `--backend pytorch` (simulation) | `--backend tensorrt` (real) |
+|---|---|---|
+| What happens | Values are rounded onto the format's grid ("fake quantization") but stored and computed in FP32 | A TensorRT engine stores the weights in the format and, where kernels exist, computes in it |
+| Use it for | **Accuracy** of any format, with no hardware restrictions | **Storage, latency and memory** of what the GPU can really run |
+| Formats | All | INT8 and FP8 (weights + activations); INT4 and FP4 (weight storage only) |
+
+PyTorch has no INT8/FP8/FP4 convolution kernels on CUDA, so the real path
+goes through ONNX: the FP32 model is exported to an ONNX graph,
+QuantizeLinear/DequantizeLinear (Q/DQ) nodes mark which tensors use which
+format and scale, and TensorRT fuses them into low-precision kernels.
+
+```text
+checkpoint ──export_onnx.py──▶ FP32 ONNX ──qdq_onnx.py──▶ Q/DQ ONNX ──trt_engine.py──▶ engine
+                                     (qdq_onnx.py and trt_engine.py are called by test.py --backend tensorrt)
 ```
 
-For W8A8, first calibrate activation input ranges using training samples:
+### Formats (`--quant`)
+
+All formats use symmetric scale quantization, `x_hat = round_to_format(x * s) / s`
+with `s = qmax / amax`; only the grid changes.
+
+| `--quant` | Grid | qmax | Simulation | TensorRT (RTX 5080, TensorRT 11.4) |
+|---|---|---:|---|---|
+| `INT8` | Integers in [-127, 127] | 127 | ✅ | ✅ W8A8: INT8 kernels, INT32 accumulation |
+| `FP8` | E4M3 minifloat | 448 | ✅ | ✅ W8A8: E4M3 kernels, FP32 accumulation |
+| `INT4` | Integers in [-7, 7] | 7 | ✅ | Weight-only: 4-bit weights stored in the engine, FP32 convolutions |
+| `FP4` | E2M1: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6} | 6 | ✅ | Weight-only, same as INT4 |
+| `FP6` | E2M3 minifloat | 7.5 | ✅ | ❌ (no FP6 type in TensorRT) |
+| `NVFP4` | FP4, blocks of 16, E4M3 block scales | 6 | ✅ | ❌ |
+| `MXFP4` | FP4, blocks of 32, power-of-two (E8M0) block scales | 6 | ✅ | ❌ |
+
+Not available in TensorRT for convolutions: 4-bit activations, block scales,
+different formats for activations and weights, and FP6. `test.py` stops with
+an explanation instead of silently falling back to FP32. Weight-only INT8/FP8
+engines are built, but TensorRT folds those weights back to FP32 (the
+`storage` column says so).
+
+FP16/BF16 (`--cast`, `--precision`) are not quantization: they are native
+PyTorch types with their own kernels, no scales and no calibration.
+
+### Options
+
+| Option | Meaning |
+|---|---|
+| `--quant MODE` | Weight format (and default activation format), see the table above |
+| `--block-size N` | Weights: one scale per N input channels instead of per output channel (NVFP4: 16, MXFP4: 32 by default) |
+| `--scale-format {fp32,e4m3,e8m0}` | Storage of the block scales (default `fp32`; set by the NVFP4/MXFP4 presets) |
+| `--act-calib METHOD --calib-file JSON` | Also quantize the input of every layer, per tensor, with a calibrated range |
+| `--act-dynamic` | Quantize activations per block of input channels, range computed on the fly (no calibration) |
+| `--act-format FMT` | Activation format different from the weights (e.g. `--quant INT4 --act-format INT8` = W4A8) |
+| `--fp-layers a,b` | Layers kept in FP32, weights and input (e.g. `enc1.block.0`) |
+| `--backend {pytorch,tensorrt}` | Simulation or real engine |
+| `--upsample {convtranspose,depth2space}` | TensorRT graph for the upsamplers (FP8 uses `depth2space` automatically) |
+
+Without `--act-calib`/`--act-dynamic` only the weights are quantized and the
+activations stay in FP32 (W8A32, W4A32, ...). BatchNorm is always folded
+into the convolutions first (`quantization/bn_fold.py`).
+
+### Recommended workflow
+
+Run every command from the repository root. Use the validation split for
+all comparisons; evaluate the held-out test set (`--split full`) only once,
+for the final results.
+
+**1. Train** in FP32 (or with AMP, `--precision BF16`). `--cast BF16`/`--cast FP16`
+train the whole model in 16 bits without FP32 master weights, as a separate
+experiment.
+
+```bash
+python train.py --dataset Carvana --epochs 10 --batch-size 5 --experiment-name CarvanaBaseline
+```
+
+**2. FP32 baseline** on the validation split (the reference for every
+comparison; TF32 is off by default):
+
+```bash
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth
+```
+
+**3. Calibrate** the activation ranges. The script runs the BN-folded FP32
+model, without quantizing anything, on 128 training images and saves one
+range (`amax`) per layer for every method. Both the simulation and TensorRT
+read this file. Weights need no calibration: their range comes from the
+weights themselves.
 
 ```bash
 python -m quantization.calibrate --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --samples 128
 ```
 
-The default output is
-`calibration/best_CarvanaBaseline_n128.json`. Then select one of the
-calibration methods when evaluating:
+Methods: `max`, `percentile-99.9`, `percentile-99.99`, `percentile-99.999`,
+`entropy` and `entropy-skip-zeros` (our variant that ignores the exact zeros
+produced by ReLU; plain `entropy` clips too much on this U-Net).
+
+**4. Simulate** the formats to measure accuracy (fast, any format):
 
 ```bash
 python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --quant INT8 --act-calib percentile-99.99 --calib-file calibration/best_CarvanaBaseline_n128.json
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --quant INT4 --fp-layers enc1.block.0
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --quant INT4 --block-size 32
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --quant NVFP4 --fp-layers enc1.block.0
 ```
 
-Calibration methods are `max`, `percentile-99.9`, `percentile-99.99`,
-`percentile-99.999`, `entropy`, and `entropy-skip-zeros`. Calibration samples
-come from the checkpoint's training split; the JSON stores the sampled IDs,
-per-layer histograms, thresholds, and split metadata. The `--seed` option in
-this command (default 42) selects the calibration subset; it is separate from
-the seed used to define the training split. Set `--base-channels` to match a
-non-default checkpoint when calibrating and evaluating. `--samples` defaults
-to 128, `--bins` to 2048, and `--num-workers` to 4. Use `--output` to override
-the default JSON path.
-
-Calibration uses a folded, FP32 Modern U-Net and observes the inputs to each
-Conv2d and ConvTranspose2d without modifying them. Its first pass records each
-layer's maximum absolute input value; its second pass builds the histograms
-used by the percentile and entropy methods. `entropy-skip-zeros` removes exact
-zero counts before applying the entropy threshold selection.
-
-This PyTorch path is a **numerical simulation**, not actual INT8 execution:
-values are rounded/clipped to INT8 codes and dequantized to FP32 before
-convolution. Parameters and activations remain FP32, and CUDA uses FP32
-convolution computation (or TF32 convolution tactics if `--tf32 on`). It
-measures the effect of quantization error; it does not provide INT8 model
-compression or INT8 acceleration.
-
-`--fp-layers enc1.block.0,segment` leaves the named convolution weights and
-their inputs in floating point. The names must match layers in the selected
-model. `--act-calib` and `--calib-file` must be supplied together and require
-`--quant INT8`. INT8 simulation requires FP32 evaluation: do not combine it
-with `--cast` or non-FP32 `--precision`. BatchNorm folding is automatic for
-`--quant INT8`; `--fold-bn` is only needed when testing folding without INT8.
-
-### ONNX export and TensorRT
-
-Export the Modern U-Net checkpoint to a dynamic-shape FP32 ONNX graph before
-using TensorRT:
+**5. Export to ONNX** once per checkpoint (twice for FP8):
 
 ```bash
 python -m quantization.export_onnx --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth
+python -m quantization.export_onnx --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --upsample depth2space
 ```
 
-By default this writes
-`exports/best_CarvanaBaseline_fp32_bnfolded.onnx` and a JSON metadata file.
-BatchNorm is folded unless `--keep-bn` is specified. The exporter supports
-dynamic image height and width from 16 to 8192 pixels and rewrites the U-Net
-transpose-convolution upsampling to preserve its dynamic-size behavior.
-Use `--output` to select a different ONNX path.
-
-The TensorRT backend requires a CUDA GPU, `--model modern`, and
-`--batch-size 1`; do not pass `--cast`, `--precision`, or `--fold-bn`. The
-engine profile is built from the evaluated image sizes. For FP32 TensorRT
-inference:
+**6. Run the real engines** with TensorRT (FP32 first, as the TensorRT reference):
 
 ```bash
 python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --backend tensorrt
-```
-
-TensorRT builds and caches an engine beside the ONNX file under `engines/`.
-The cache is specific to the ONNX graph, GPU, TensorRT version, image-size
-profile, and TF32 setting. Use `--rebuild-engine` to rebuild it, or `--onnx`
-to select another exported graph. The engine inspector reports the actual
-convolution layers, data types, and tactics used; the requested graph precision
-alone is not treated as proof of the precision that ran. Engine metadata and
-per-layer inspection are saved next to each engine as `.json` and
-`.layers.json` files.
-
-To run TensorRT with the INT8 Q/DQ graph, add `--quant INT8`. W8A32 needs no
-calibration JSON; W8A8 also needs `--act-calib` and `--calib-file`:
-
-```bash
 python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --backend tensorrt --quant INT8 --act-calib percentile-99.99 --calib-file calibration/best_CarvanaBaseline_n128.json
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --backend tensorrt --quant FP8 --act-calib percentile-99.99 --calib-file calibration/best_CarvanaBaseline_n128.json --fp-layers enc1.block.0
+python test.py --dataset Carvana --checkpoint checkpoints/best_CarvanaBaseline.pth --backend tensorrt --quant INT4 --fp-layers enc1.block.0
 ```
 
-`test.py` automatically turns the FP32 ONNX export into an INT8 Q/DQ ONNX
-graph and builds or reuses the TensorRT engine. In this path, weights are
-stored as INT8 initializers in the ONNX graph, and TensorRT may fuse Q/DQ
-operations into INT8 convolution kernels. Actual layer precision is reported
-from the built engine. TensorRT's Q/DQ rounding and saturation can differ
-slightly from the PyTorch fake-quant reference.
+Compare TensorRT quantized runs with the TensorRT FP32 run, not with PyTorch
+FP32: TensorRT FP32 alone is about twice as fast as PyTorch, so a comparison
+against PyTorch mixes the effect of the engine with the effect of quantization.
 
-The ONNX conversion can also be run explicitly. For example, to create a
-W8A8 graph without running evaluation:
+### Practical notes
+
+- **Keep the first convolution in FP32** (`--fp-layers enc1.block.0`) for FP8
+  and every 4-bit format. Its 27-weight filters sum to almost zero, so on
+  uniform image regions their rounding errors add up instead of cancelling.
+  It is 1,728 of 31 M weights. Carvana validation, weights only (FP32 = 0.9907):
+
+  | Weights | All layers quantized | `enc1.block.0` in FP32 |
+  |---|---:|---:|
+  | INT4 per channel | 0.4572 | 0.9909 |
+  | INT4, blocks of 32 | 0.9632 | 0.9910 |
+  | FP4 per channel | 0.9323 | 0.9891 |
+  | NVFP4 | 0.8222 | 0.9903 |
+  | MXFP4 | 0.3531 | 0.9848 |
+  | FP6 per channel | 0.9781 | 0.9907 |
+  | FP8 per channel | 0.9719 | 0.9908 |
+- **Engines are specific** to the GPU model and TensorRT version: build them
+  on each machine (they are cached under `exports/engines/`). The L40/L40S has
+  FP8 and INT8 but no FP4/FP6 hardware.
+- **Memory:** simulating FP8/FP6/FP4 *activations* creates temporaries the
+  size of each activation and does not fit full-resolution Carvana on a 16 GB
+  GPU. Weight-only simulation and INT8/INT4 activation simulation (in place)
+  use the same memory as FP32. ISIC's largest images (up to 2848×4288) need
+  more memory than the RTX 5080 has in FP32.
+- **Variable sizes:** the engine profile covers the sizes of the evaluated
+  images. Carvana has one size; ISIC has 74, which has not been tested yet.
+- The low-level scripts can be run on their own: `quantization/qdq_onnx.py`
+  writes a Q/DQ ONNX (`--format int8|fp8|int4|fp4`), and
+  `quantization/env_report.py` prints the software/hardware versions.
+
+### Code map
+
+| File | Responsibility |
+|---|---|
+| `quantization/modes.py` | Command-line options → what to quantize and how; what each backend can do |
+| `quantization/formats.py` | Number formats (INT8/INT4/FP8/FP6/FP4) and granularities (tensor/channel/block) for the simulation |
+| `quantization/int8.py` | INT8 arithmetic (scale, quantize, dequantize, in-place fake quantization) |
+| `quantization/bn_fold.py` | Folds BatchNorm into the preceding convolution |
+| `quantization/quantize_model.py` | Applies the simulation to the model (weights once, activations through hooks) |
+| `quantization/calibrate.py` | Activation ranges from training images |
+| `quantization/export_onnx.py` | FP32 ONNX with dynamic H, W (exact rewrites of the ConvTranspose upsamplers) |
+| `quantization/qdq_onnx.py` | FP32 ONNX → ONNX with low-precision weights and Q/DQ nodes |
+| `quantization/trt_engine.py` | Builds, caches, inspects and runs TensorRT engines |
+| `quantization/env_report.py` | GPU, driver, CUDA, PyTorch and TensorRT versions |
+| `utilis/evaluation.py` | test.py helpers, including the representation/storage/execution description |
+
+### Tests
+
+The unit tests check the arithmetic against independent references (e.g.
+the FP4/FP6/FP8 grids against `ml_dtypes`), that the ONNX rewrites are exact,
+and that the engines really use the expected kernels. They are not needed to
+train or evaluate. Run them all from the repository root (TensorRT tests are
+skipped without a CUDA GPU and TensorRT):
 
 ```bash
-python -m quantization.qdq_onnx --onnx exports/best_CarvanaBaseline_fp32_bnfolded.onnx --calib-file calibration/best_CarvanaBaseline_n128.json --act-calib percentile-99.99
+python -m unittest discover -s tests -t .
 ```
 
-Omit both `--calib-file` and `--act-calib` for W8A32; use `--fp-layers` to
-leave selected layers in FP32. The script writes a Q/DQ ONNX file and metadata
-including source hashes and initializer sizes. Pass `--force` to regenerate a
-cached Q/DQ graph.
-
-## Quantization tests
-
-The unit tests are not needed to run training or evaluation. Run the core
-PyTorch quantization tests from the repository root with:
-
-```bash
-python -m unittest quantization.test_int8 quantization.test_bn_fold quantization.test_quantize_model quantization.test_calibrate -v
-```
-
-ONNX export and Q/DQ tests are separate:
-
-```bash
-python -m unittest quantization.test_export_onnx quantization.test_qdq_onnx -v
-```
-
-TensorRT engine tests require a compatible CUDA/TensorRT installation; the
-engine-specific tests skip when those components are unavailable:
-
-```bash
-python -m unittest quantization.test_trt_engine -v
-```
+Or a single file, e.g. `python -m unittest tests.test_formats -v`.

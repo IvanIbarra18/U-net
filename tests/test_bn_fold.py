@@ -1,7 +1,7 @@
 """Unit tests for quantization/bn_fold.py.
 
 Run from the repository root:
-    python -m unittest quantization.test_bn_fold -v
+    python -m unittest tests.test_bn_fold -v
 """
 
 import unittest
@@ -14,7 +14,7 @@ from quantization.bn_fold import fold_batchnorm, fold_conv_bn
 
 
 def randomize_bn(model: nn.Module) -> None:
-    """Non-trivial BN statistics (fresh BN is the identity, which proves nothing)."""
+    """Give BN statistics that are not trivial. (A new BN is the identity, so it proves nothing.)"""
     with torch.no_grad():
         for m in model.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -50,10 +50,10 @@ class TestBNFold(unittest.TestCase):
         model.eval()
         folded = fold_batchnorm(model)
 
-        # 2 BN per DoubleConv x 9 DoubleConvs (4 enc + bottleneck + 4 dec).
+        # 2 BN in each DoubleConv x 9 DoubleConvs (4 encoder + bottleneck + 4 decoder).
         self.assertEqual(folded.folded_bn_count, 18)
         self.assertFalse(any(isinstance(m, nn.BatchNorm2d) for m in folded.modules()))
-        # The original model is untouched.
+        # The original model does not change.
         self.assertEqual(sum(isinstance(m, nn.BatchNorm2d) for m in model.modules()), 18)
 
         x = torch.rand(2, 3, 64, 80)

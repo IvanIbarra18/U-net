@@ -1,24 +1,24 @@
 """Symmetric INT8 scale quantization (Wu et al., 2020, Sec. 3).
 
-Notation (same as the paper):
-    amax   clipping threshold alpha: values in [-amax, amax] are representable.
+Notation (the same as in the paper):
+    amax   the clipping threshold alpha. We can store values in [-amax, amax].
     scale  s = qmax / amax, with qmax = 2^(b-1) - 1 = 127 for 8 bits.
     x_q    = clip(round(s * x), -qmax, qmax)   (the integer)
     x_hat  = x_q / s                           (the dequantized value)
 
-The range is [-127, 127]: -128 is never produced, so the mapping is exactly
-symmetric and the zero point is 0 (no extra cross terms in the integer dot
-product).
+The range is [-127, 127]. We never produce -128, so the mapping is exactly
+symmetric and the zero point is 0. Because of this, the integer dot product
+has no extra cross terms.
 
 Granularity:
-    per-tensor   amax is a scalar (used for activations).
-    per-channel  amax has one value per channel along `axis` (used for
-                 weights): axis=0 for Conv2d [C_out, C_in, kH, kW],
+    per-tensor   amax is one number (used for activations).
+    per-channel  amax has one value for each channel along `axis` (used for
+                 weights): axis=0 for Conv2d [C_out, C_in, kH, kW], and
                  axis=1 for ConvTranspose2d [C_in, C_out, kH, kW].
 
-This module only does the arithmetic. Everything runs in floating point:
-fake_quantize() returns values restricted to the INT8 grid, which simulates
-the accuracy effect of INT8 but not its speed or memory.
+This module only does the math. Everything runs in floating point.
+fake_quantize() returns values that are limited to the INT8 grid. This
+simulates how INT8 changes the accuracy, but not its speed or memory use.
 """
 
 import torch
@@ -26,12 +26,12 @@ import torch
 NUM_BITS = 8
 QMAX = 2 ** (NUM_BITS - 1) - 1  # 127
 
-# Guard for the division in compute_scale (amax = 0 is handled separately).
+# Protects the division in compute_scale. (The case amax = 0 is handled on its own.)
 _MIN_AMAX = torch.finfo(torch.float32).tiny
 
 
 def weight_axis(module: torch.nn.Module) -> int:
-    """Output-channel axis of a convolution weight."""
+    """Return the output-channel axis of a convolution weight."""
     if isinstance(module, torch.nn.ConvTranspose2d):
         return 1
     if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
@@ -48,8 +48,8 @@ def _broadcast_shape(x: torch.Tensor, axis: int) -> list:
 def compute_amax(x: torch.Tensor, axis: int | None = None) -> torch.Tensor:
     """Max calibration: amax = max(|x|), per tensor (axis=None) or per channel.
 
-    Returns a scalar tensor, or a tensor shaped to broadcast against `x`
-    (e.g. [C, 1, 1, 1] for axis=0 on a 4-D weight).
+    Returns a scalar tensor, or a tensor with a shape that broadcasts against
+    `x` (for example, [C, 1, 1, 1] for axis=0 on a 4-D weight).
     """
     x = x.detach().float()
     if axis is None:
@@ -59,21 +59,24 @@ def compute_amax(x: torch.Tensor, axis: int | None = None) -> torch.Tensor:
     return x.abs().amax(dim=reduce_dims, keepdim=True)
 
 
-def compute_scale(amax: torch.Tensor) -> torch.Tensor:
-    """s = qmax / amax (in FP32).
+def compute_scale(amax: torch.Tensor, qmax: float = QMAX) -> torch.Tensor:
+    """Return s = qmax / amax (in FP32).
 
-    An all-zero tensor/channel (amax = 0) gets s = 1, so it quantizes to
-    zeros exactly instead of 0 * inf = NaN.
+    By default qmax is 127, the value for INT8. formats.py passes the qmax of
+    other formats (INT4: 7, FP8 E4M3: 448, and so on).
+
+    If a tensor or channel is all zeros (amax = 0), it gets s = 1. Then it
+    quantizes to exact zeros, and we avoid 0 * inf = NaN.
     """
     amax = amax.float()
-    return torch.where(amax > 0, QMAX / amax.clamp_min(_MIN_AMAX), torch.ones_like(amax))
+    return torch.where(amax > 0, qmax / amax.clamp_min(_MIN_AMAX), torch.ones_like(amax))
 
 
 def quantize(x: torch.Tensor, amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Real -> INT8. Returns (x_q as torch.int8, scale).
+    """Convert real values to INT8. Returns (x_q as torch.int8, scale).
 
-    torch.round rounds half to even (e.g. 2.5 -> 2), as IEEE and most
-    hardware do; it only differs from round-half-up on exact ties.
+    torch.round rounds half to even (for example, 2.5 becomes 2), like IEEE
+    and most hardware. It only differs from round-half-up on exact ties.
     """
     scale = compute_scale(amax)
     x_q = torch.clamp(torch.round(x.float() * scale), -QMAX, QMAX)
@@ -81,16 +84,16 @@ def quantize(x: torch.Tensor, amax: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 
 def dequantize(x_q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """INT8 -> real: x_hat = x_q / s (in FP32)."""
+    """Convert INT8 back to real values: x_hat = x_q / s (in FP32)."""
     return x_q.float() / scale
 
 
 def fake_quantize(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
-    """Quantize then dequantize, returning `x`'s dtype.
+    """Quantize and then dequantize. The result has the dtype of `x`.
 
-    Equivalent to dequantize(*quantize(x, amax)) but without materializing
-    an int8 tensor; this is what a simulated-INT8 layer applies to its input
-    and its weight.
+    This gives the same result as dequantize(*quantize(x, amax)), but it
+    never creates an int8 tensor. A simulated INT8 layer applies this to its
+    input and to its weight.
     """
     scale = compute_scale(amax)
     x_hat = torch.clamp(torch.round(x.float() * scale), -QMAX, QMAX) / scale
@@ -98,12 +101,13 @@ def fake_quantize(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
 
 
 def fake_quantize_(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
-    """In-place fake_quantize for FP32 activations.
+    """An in-place fake_quantize for FP32 activations.
 
-    Same result as fake_quantize(), but overwrites `x` instead of creating
-    four temporaries the size of `x`. At full ISIC resolution one activation
-    can take ~12 GB, so the out-of-place version does not fit. Only use it on
-    tensors nothing else reads afterwards.
+    It gives the same result as fake_quantize(), but it writes over `x`.
+    The normal version creates four temporary tensors as big as `x`. At full
+    ISIC resolution, one activation can take about 12 GB, so the normal
+    version does not fit in memory. Only use this on tensors that nothing
+    else reads later.
     """
     if x.dtype != torch.float32:
         raise TypeError("fake_quantize_ expects an FP32 tensor.")
@@ -112,11 +116,11 @@ def fake_quantize_(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
 
 
 def quantization_error(x: torch.Tensor, amax: torch.Tensor) -> dict:
-    """Error statistics of fake-quantizing `x` with threshold `amax`.
+    """Return error statistics for fake-quantizing `x` with threshold `amax`.
 
-    sqnr_db is the signal-to-quantization-noise ratio,
-    10 * log10(sum(x^2) / sum((x - x_hat)^2)): higher is better; each extra
-    bit is worth about 6 dB.
+    sqnr_db is the signal-to-quantization-noise ratio:
+    10 * log10(sum(x^2) / sum((x - x_hat)^2)). Higher is better. Each extra
+    bit adds about 6 dB.
     """
     x = x.detach().float()
     x_hat = fake_quantize(x, amax)

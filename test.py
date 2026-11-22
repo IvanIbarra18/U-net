@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import os
 import time
@@ -17,14 +16,23 @@ from data.splits import get_split_indices
 from data.transforms import PairTransformDataset
 from models.unet_classic import UNetClassic
 from models.unet_modern import UNetModern
-from PIL import Image
-
+from quantization import modes as quant_modes
 from quantization.bn_fold import fold_batchnorm
 from quantization.env_report import environment_info
-from quantization.quantize_model import prepare_int8_model
+from quantization.quantize_model import prepare_quantized_model
 from utilis.checkpoint import load_checkpoint
+from utilis.evaluation import describe_precision, image_sizes, split_arg
 from utilis.loss import DiceBCELoss
-from utilis.metrics import append_summary_row, dice_score
+from utilis.metrics import dice_score
+from utilis.reporting import (
+    LOSS_COMPONENTS,
+    append_summary_row,
+    peak_gpu_memory_mib,
+    per_sample_filename,
+    sample_means,
+    summary_row,
+    write_per_sample_csv,
+)
 
 cudnn.benchmark = True
 
@@ -32,28 +40,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATASETS_DIR = ROOT_DIR / "datasets"
 
 CAST_DTYPES = {"FP16": torch.float16, "BF16": torch.bfloat16}
-LOSS_COMPONENTS = ("bce_loss", "dice_loss", "bce_contribution", "dice_contribution")
-PER_SAMPLE_FIELDS = (
-    "sample_id",
-    "model",
-    "total_params",
-    "loss",
-    *LOSS_COMPONENTS,
-    "dice",
-)
-
-
-def split_arg(value):
-    """Accept a predefined split index (0-4) or 'full' for the test dataset."""
-    if value.lower() == "full":
-        return "full"
-    try:
-        index = int(value)
-    except ValueError:
-        index = None
-    if index not in range(5):
-        raise argparse.ArgumentTypeError("must be 0-4 or 'full'")
-    return index
 
 
 def parse_args():
@@ -71,12 +57,10 @@ def parse_args():
     parser.add_argument("--cast",type=str.upper,choices=list(CAST_DTYPES),default=None,help=("Convert the whole model (weights and BatchNorm buffers) and its inputs to this dtype. ""If omitted, the model keeps the checkpoint's dtype (usually FP32)."),)
     parser.add_argument("--tf32",type=str.lower,choices=["on", "off"],default="off",help=("Allow TF32 (10-bit mantissa inputs) in FP32 convolutions and matmuls on Ampere+ GPUs. ""Default off: FP32 means true FP32. PyTorch's own default for cuDNN convolutions is on."),)
     parser.add_argument("--fold-bn",action="store_true",help="Fold BatchNorm into the preceding convolutions (same function; sanity check for quantization).",)
-    parser.add_argument("--quant",type=str.upper,choices=["NONE", "INT8"],default="NONE",help=("Simulated (fake) quantization, run in FP32. INT8: BN folding + symmetric per-channel ""max-calibrated INT8 weights (W8A32). Measures accuracy, not INT8 speed."),)
-    parser.add_argument("--act-calib",type=str.lower,default=None,help=("Also quantize the input of every quantized layer (W8A8), per-tensor, with this method from --calib-file: ""max, percentile-99.9, percentile-99.99, percentile-99.999 or entropy. Omit for weight-only (W8A32)."),)
-    parser.add_argument("--calib-file",type=Path,default=None,help="JSON written by quantization/calibrate.py for this checkpoint.",)
-    parser.add_argument("--fp-layers",type=lambda value: [name for name in value.split(",") if name],default=[],help="Comma-separated Conv/ConvTranspose layer names kept in floating point (e.g. enc1.block.0,segment).",)
+    quant_modes.add_arguments(parser)  # --quant, --block-size, --act-*, --calib-file, --fp-layers
     parser.add_argument("--backend",type=str.lower,choices=["pytorch", "tensorrt"],default="pytorch",help=("pytorch: run the model in PyTorch (FP32, --cast, --precision, fake --quant). ""tensorrt: run a TensorRT engine built from the ONNX export (strongly typed, batch 1)."),)
     parser.add_argument("--onnx",type=Path,default=None,help="ONNX file for --backend tensorrt (default: exports/<checkpoint>_fp32_bnfolded.onnx from quantization/export_onnx.py).",)
+    parser.add_argument("--upsample",choices=["convtranspose", "depth2space"],default=None,help=("TensorRT export of the ConvTranspose upsamplers: convtranspose, or depth2space = exact 1x1 Conv + DepthToSpace ""(default for --quant FP8: TensorRT has no FP8 deconvolution kernels; default convtranspose otherwise)."),)
     parser.add_argument("--rebuild-engine",action="store_true",help="Rebuild the TensorRT engine even if a cached one matches.",)
     parser.add_argument("--warmup-batches",type=int,default=3,help="Batches excluded from timing (they are still included in the metrics).",)
     parser.add_argument("--output",type=Path,default=Path("test_results"),help="Directory for evaluation results.",)
@@ -97,66 +81,23 @@ def parse_args():
         parser.error("--cast and --precision (autocast) are separate experiments; use only one.")
     if args.quant != "NONE" and (args.cast is not None or args.precision != "FP32"):
         parser.error("--quant is simulated in FP32; do not combine it with --cast or --precision.")
-    if args.fp_layers and args.quant == "NONE":
-        parser.error("--fp-layers only applies with --quant.")
-    if args.act_calib is not None and (args.quant == "NONE" or args.calib_file is None):
-        parser.error("--act-calib needs --quant INT8 and --calib-file.")
-    if args.calib_file is not None and args.act_calib is None:
-        parser.error("--calib-file needs --act-calib.")
+    quant_modes.validate(args, parser)
     if args.backend == "tensorrt":
         if args.model != "modern":
             parser.error("--backend tensorrt is implemented for --model modern only.")
         if args.cast is not None or args.precision != "FP32" or args.fold_bn:
-            parser.error("--backend tensorrt: the precision comes from the ONNX graph (FP32, or INT8 Q/DQ with --quant); "
+            parser.error("--backend tensorrt: the precision comes from the ONNX graph (FP32, or Q/DQ with --quant); "
                          "do not use --cast, --precision or --fold-bn (BN is always folded in the export).")
         if args.batch_size != 1:
             parser.error("--backend tensorrt engines are built for --batch-size 1 (images have different sizes).")
         if not torch.cuda.is_available():
             parser.error("--backend tensorrt needs a CUDA GPU.")
-    elif args.onnx is not None or args.rebuild_engine:
-        parser.error("--onnx and --rebuild-engine only apply with --backend tensorrt.")
+        if args.upsample is None:
+            args.upsample = "depth2space" if args.quant == "FP8" else "convtranspose"
+    elif args.onnx is not None or args.rebuild_engine or args.upsample is not None:
+        parser.error("--onnx, --upsample and --rebuild-engine only apply with --backend tensorrt.")
 
     return args
-
-
-def describe_precision(args, quantization_name, use_amp, model_format, trt_summary=None):
-    """The three properties every result must state separately:
-    representation  which values the numbers are restricted to;
-    storage         how weights are actually held in memory;
-    execution       what the kernels actually computed in.
-    """
-    if args.backend == "tensorrt":
-        # Storage and execution come from the built engine (kernel names and
-        # tensor dtypes), not from what the ONNX graph asked for.
-        counts = lambda field: ", ".join(f"{count}x {kind}" for kind, count in trt_summary[field].items())
-        tf32 = f", {trt_summary['tf32_tactics']} TF32 tactics" if trt_summary["tf32_tactics"] else ""
-        if args.quant == "INT8":
-            what = "weights+activations" if quantization_name == "INT8-W8A8" else "weights"
-            representation = f"int8 grid ({what})"
-        else:
-            representation = "fp32"
-        storage = f"TensorRT engine, conv weights [{counts('weights')}]"
-        execution = f"tensorrt [{counts('compute_layers')}; accumulators {counts('accumulators')}{tf32}]"
-        return representation, storage, execution
-    tf32 = " (TF32 convs)" if args.tf32 == "on" else ""
-    if args.quant == "INT8":
-        what = "weights+activations" if quantization_name == "INT8-W8A8" else "weights"
-        return f"int8 grid ({what})", "fp32", f"pytorch fp32{tf32} (simulated int8)"
-    if args.cast is not None:
-        return model_format.lower(), model_format.lower(), f"pytorch {model_format.lower()}"
-    if use_amp:
-        return f"mixed (autocast {args.precision.lower()})", "fp32", f"pytorch autocast {args.precision.lower()}"
-    return "fp32", "fp32", f"pytorch fp32{tf32}"
-
-
-def image_sizes(base_dataset, sample_ids):
-    """(H, W) of each image, read from the file headers (no decoding)."""
-    sizes = []
-    for sample_id in sample_ids:
-        with Image.open(base_dataset.image_files[sample_id][0]) as image:
-            width, height = image.size
-        sizes.append((height, width))
-    return sizes
 
 
 def main():
@@ -177,8 +118,8 @@ def main():
     if not args.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
 
-    # With TensorRT the PyTorch model is only needed for its parameter count:
-    # keep the checkpoint and the model on the CPU so they take no GPU memory.
+    # With TensorRT, we only need the PyTorch model to count its parameters.
+    # So we keep the checkpoint and the model on the CPU, where they use no GPU memory.
     model_device = torch.device("cpu") if args.backend == "tensorrt" else device
 
     checkpoint = load_checkpoint(args.checkpoint, model_device)
@@ -291,7 +232,7 @@ def main():
     if args.cast is not None:
         model = model.to(device=device, dtype=CAST_DTYPES[args.cast])
 
-    # Quantization works on an eval-mode copy; the checkpoint is never changed.
+    # Quantization works on an eval-mode copy. The checkpoint never changes.
     act_amax = None
     calib_samples = None
     if args.act_calib is not None:
@@ -307,23 +248,20 @@ def main():
         act_amax = {name: layer["amax"][args.act_calib] for name, layer in calibration["layers"].items()}
         calib_samples = calibration["samples"]
 
-    if args.quant == "INT8":
-        model.eval()
-        model, weight_stats = prepare_int8_model(model, fp_layers=args.fp_layers, act_amax=act_amax)
-        quantization_name = "INT8-W8A8" if act_amax is not None else "INT8-W8A32"
-        worst = min(weight_stats, key=lambda row: row["sqnr_db"])
-        print(
-            f"INT8 weights: {len(weight_stats)} layers quantized "
-            f"(per-channel, max), {len(args.fp_layers)} kept in FP. "
-            f"Lowest weight SQNR: {worst['sqnr_db']:.1f} dB ({worst['layer']})"
-        )
-        if act_amax is not None:
-            print(
-                f"INT8 activations: per-tensor, {args.act_calib} calibration "
-                f"({calib_samples} training samples, {args.calib_file})"
-            )
-        if args.tf32 == "on":
-            print("Warning: TF32 adds its own rounding on top of the simulated INT8 error.")
+    if args.quant != "NONE":
+        quantization_name = quant_modes.mode_name(args)
+        print(f"Quantization {quantization_name}: {quant_modes.describe(args)}"
+              + (f" ({args.act_calib} calibration, {calib_samples} training samples)" if args.act_calib else ""))
+        if args.backend == "pytorch":
+            # Simulation (fake quantization) on an eval-mode, BN-folded copy.
+            model.eval()
+            model, weight_stats = prepare_quantized_model(
+                model, quant_modes.weight_spec(args), quant_modes.activation_spec(args), act_amax, args.fp_layers)
+            worst = min(weight_stats, key=lambda row: row["sqnr_db"])
+            print(f"Simulated weights: {len(weight_stats)} layers quantized, {len(args.fp_layers)} kept in FP. "
+                  f"Lowest weight SQNR: {worst['sqnr_db']:.1f} dB ({worst['layer']})")
+            if args.tf32 == "on":
+                print("Warning: TF32 adds its own rounding on top of the simulated quantization error.")
     elif args.fold_bn:
         model.eval()
         model = fold_batchnorm(model)
@@ -346,27 +284,32 @@ def main():
     if args.backend == "tensorrt":
         from quantization.trt_engine import TensorRTModel, get_engine, profile_from_sizes
 
-        onnx_path = args.onnx or ROOT_DIR / "exports" / f"{args.checkpoint.stem}_fp32_bnfolded.onnx"
+        d2s = args.upsample == "depth2space"
+        onnx_path = args.onnx or ROOT_DIR / "exports" / f"{args.checkpoint.stem}_fp32_bnfolded{'_d2s' if d2s else ''}.onnx"
         if not onnx_path.is_file():
             raise FileNotFoundError(
                 f"{onnx_path} not found. Export it first:\n  python -m quantization.export_onnx "
-                f"--dataset {args.dataset} --checkpoint {args.checkpoint}"
+                f"--dataset {args.dataset} --checkpoint {args.checkpoint}{' --upsample depth2space' if d2s else ''}"
             )
         export_info = json.loads(onnx_path.with_suffix(".json").read_text(encoding="utf-8"))
         if export_info["dataset"] != args.dataset or Path(export_info["checkpoint"]).name != args.checkpoint.name:
             raise ValueError(f"{onnx_path} was exported from {export_info['checkpoint']} ({export_info['dataset']}).")
-        if args.quant == "INT8":
-            # Same quantization as the fake-quant reference, written into the
-            # graph as INT8 weights + Q/DQ nodes (cached next to the FP32 ONNX).
-            from quantization.qdq_onnx import build_int8_onnx
+        if export_info.get("upsample", "convtranspose") != args.upsample:
+            raise ValueError(f"{onnx_path} was exported with --upsample {export_info.get('upsample', 'convtranspose')}, not {args.upsample}.")
+        if args.quant != "NONE":
+            # INT8 uses the same quantization as the fake-quant reference. FP8 uses
+            # E4M3 with scale amax/448. Both are written into the graph as
+            # low-precision weights and Q/DQ nodes (saved next to the FP32 ONNX).
+            from quantization.qdq_onnx import build_quantized_onnx
 
-            onnx_path = build_int8_onnx(onnx_path, args.calib_file, args.act_calib, args.fp_layers)
-            print(f"INT8 ONNX: {onnx_path.name}")
+            fmt, _ = quant_modes.TENSORRT_MODES[args.quant]
+            onnx_path = build_quantized_onnx(onnx_path, args.calib_file, args.act_calib, args.fp_layers, fmt=fmt)
+            print(f"{args.quant} ONNX: {onnx_path.name}")
         # The engine accepts exactly the image sizes of the evaluated samples.
         profile = profile_from_sizes(image_sizes(base_dataset, sample_ids))
         engine_path = get_engine(onnx_path, profile, tf32=use_tf32, n_channels=input_channels, rebuild=args.rebuild_engine)
         forward = TensorRTModel(engine_path)
-        trt_summary = forward.layer_summary()
+        trt_summary = {**forward.layer_summary(), "engine_bytes": forward.engine_bytes, "total_params": total_params}
         engine_mib = forward.engine_bytes / (1024 ** 2)
         weights_mib = None  # the weights live inside the engine (engine_mib)
         print(f"TensorRT engine: {engine_path.name} ({engine_mib:.1f} MiB)")
@@ -396,39 +339,19 @@ def main():
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(
-            tqdm(
-                dataloader,
-                desc=f"Evaluation {args.dataset}",
-                unit="batch",
-                dynamic_ncols=True,
-            )
-        ):
+            tqdm(dataloader,desc=f"Evaluation {args.dataset}",unit="batch",dynamic_ncols=True,)):
             # Normalize uint8 images to [0, 1] in FP32 on the device, then
             # round once to the model dtype (as the original FP32 pipeline).
-            images = batch["image"].to(
-                device,
-                non_blocking=(device.type == "cuda"),
-            )
-            images = (
-                images.float()
-                .div_(torch.iinfo(batch["image"].dtype).max)
-                .to(model_dtype)
-            )
-            masks = batch["mask"].to(
-                device,
-                non_blocking=(device.type == "cuda"),
-            )
+            images = batch["image"].to(device,non_blocking=(device.type == "cuda"),)
+            images = (images.float().div_(torch.iinfo(batch["image"].dtype).max).to(model_dtype))
+            masks = batch["mask"].to(device,non_blocking=(device.type == "cuda"),)
 
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
 
             start_time = time.perf_counter()
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype if use_amp else torch.float32,
-                enabled=use_amp,
-            ):
+            with torch.autocast(device_type=device.type,dtype=amp_dtype if use_amp else torch.float32,enabled=use_amp,):
                 logits = forward(images)
 
             if device.type == "cuda":
@@ -462,12 +385,7 @@ def main():
     if total_samples == 0:
         raise RuntimeError("The evaluation dataset is empty.")
 
-    # Every sample has the same weight, so batch means are sample means.
-    def sample_mean(field):
-        return sum(row[field] for row in per_sample_rows) / total_samples
-
-    mean_loss = sample_mean("loss")
-    mean_dice = sample_mean("dice")
+    means = sample_means(per_sample_rows)
     latency_ms = (timed_seconds / timed_samples * 1000 if timed_samples else float("nan"))
     throughput = (timed_samples / timed_seconds if timed_seconds > 0 else float("nan"))
 
@@ -476,8 +394,7 @@ def main():
         torch.float16: "FP16",
         torch.bfloat16: "BF16",
     }.get(model_dtype, str(model_dtype))
-    precision_name = args.cast or args.precision
-    representation, storage, execution = describe_precision(args, quantization_name, use_amp, model_format, trt_summary)
+    representation, storage, execution = describe_precision(args, use_amp, model_format, trt_summary)
     environment = environment_info()
 
     print("\nEvaluation complete")
@@ -494,82 +411,47 @@ def main():
     print(f"TF32: {args.tf32}")
     print(f"Quantization: {quantization_name}"
           + (f" (FP layers: {','.join(args.fp_layers)})" if args.fp_layers else ""))
-    print(f"Mean loss: {mean_loss:.6f}")
-    print(f"Mean Dice: {mean_dice:.6f}")
+    print(f"Mean loss: {means['mean_loss']:.6f}")
+    print(f"Mean Dice: {means['mean_dice']:.6f}")
     print(
         f"Forward latency: {latency_ms:.2f} ms/image | "
         f"Throughput: {throughput:.2f} images/s "
         f"({timed_samples} images, {warmup_batches} warm-up batches excluded)"
     )
 
-    peak_allocated = peak_reserved = None
-    if device.type == "cuda":
-        peak_allocated = (torch.cuda.max_memory_allocated(device) / (1024 ** 2))
-        peak_reserved = (torch.cuda.max_memory_reserved(device) / (1024 ** 2))
+    peak_allocated, peak_reserved = peak_gpu_memory_mib(device)
+    if peak_allocated is not None:
         print(f"Peak GPU memory allocated: {peak_allocated:.2f} MiB")
         print(f"Peak GPU memory reserved: {peak_reserved:.2f} MiB")
 
     # 1. One row per run in a shared summary, to compare runs side by side.
-    args.output.mkdir(parents=True, exist_ok=True)
     summary_path = args.output / "summary.csv"
-    append_summary_row(summary_path, {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "dataset": args.dataset,
+    run = {
         "split": split_name,
-        "model": args.model,
-        "checkpoint": str(args.checkpoint),
-        "checkpoint_epoch": (checkpoint.get("epoch") if isinstance(checkpoint, dict) else None),
+        "checkpoint_epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
         "total_params": total_params,
         "model_dtype": model_format,
         "autocast": args.precision if use_amp else "off",
-        "tf32": args.tf32,
         "quantization": quantization_name,
-        "act_calibration": args.act_calib or "",
-        "calib_samples": calib_samples or "",
-        "fp_layers": ",".join(args.fp_layers),
-        "backend": args.backend,
+        "calib_samples": calib_samples,
         "representation": representation,
         "storage": storage,
         "execution": execution,
-        "samples": total_samples,
-        "mean_loss": mean_loss,
-        **{f"mean_{name}": sample_mean(name) for name in LOSS_COMPONENTS},
-        "mean_dice": mean_dice,
+    }
+    performance = {
         "latency_ms_per_image": latency_ms,
         "throughput_images_per_sec": throughput,
         "weights_mib": weights_mib,
         "engine_mib": engine_mib,
         "peak_gpu_allocated_mib": peak_allocated,
         "peak_gpu_reserved_mib": peak_reserved,
-        "gpu": environment["gpu"],
-        "driver": environment["driver"],
-        "torch_version": environment["torch"],
-        "tensorrt_version": environment["tensorrt"] if args.backend == "tensorrt" else "",
-    })
+    }
+    append_summary_row(summary_path, summary_row(args, run, means, performance, environment))
 
-    # 2. Per-sample results of this run, for paired comparisons between
-    # precisions on exactly the same images (overwritten on reruns).
-    per_sample_path = args.output / "per_sample" / (
-        f"{args.checkpoint.stem}_{args.dataset}_{split_name}_{args.model}_"
-        f"{precision_name}{'_cast' if args.cast else ''}"
-        f"{'_trt' if args.backend == 'tensorrt' else ''}"
-        f"{'_tf32' if use_tf32 else ''}"
-        f"{'' if quantization_name == 'none' else '_' + quantization_name}"
-        f"{'_' + args.act_calib if args.act_calib else ''}"
-        f"{'_fp-' + '+'.join(args.fp_layers) if args.fp_layers else ''}.csv"
-    )
-    per_sample_path.parent.mkdir(parents=True, exist_ok=True)
-    with per_sample_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=PER_SAMPLE_FIELDS)
-        writer.writeheader()
-        writer.writerows(
-            {
-                **row,
-                "model": args.model,
-                "total_params": total_params,
-            }
-            for row in per_sample_rows
-        )
+    # 2. Per-image results of this run, to compare two runs on exactly the
+    # same images (a rerun with the same settings overwrites the file).
+    per_sample_path = args.output / "per_sample" / per_sample_filename(args, split_name, quantization_name, use_tf32)
+    write_per_sample_csv(per_sample_path, per_sample_rows, args.model, total_params)
 
     print(f"Summary appended to: {summary_path}")
     print(f"Per-sample results saved to: {per_sample_path}")

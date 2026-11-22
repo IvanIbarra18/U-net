@@ -1,16 +1,18 @@
-"""Batch Normalization folding (Wu et al., 2020, Sec. 3 / Jacob et al., 2018).
+"""Batch Normalization folding (Wu et al., 2020, Sec. 3; Jacob et al., 2018).
 
-In eval mode BatchNorm is a fixed per-channel affine map:
+In eval mode, BatchNorm does not learn anymore. For each channel k it only
+scales and shifts the input by fixed numbers (an "affine map"):
     y_k = gamma_k * (x_k - mu_k) / sigma_k + beta_k,  sigma_k = sqrt(var_k + eps)
-When it directly follows a convolution, it can be absorbed into it:
+When BatchNorm comes right after a convolution, we can merge ("fold") it
+into the convolution by changing the weights and the bias:
     w'_k = w_k * gamma_k / sigma_k
     b'_k = gamma_k * (b_k - mu_k) / sigma_k + beta_k
-The folded network computes the same function (up to FP rounding) with one
-fewer op per block. Weights must be quantized AFTER folding, because the
-folded weights are the ones that are actually executed.
+The folded network gives the same result (apart from small floating-point
+rounding), but each block has one operation less. We must quantize the
+weights AFTER folding, because the folded weights are the ones that really run.
 
-In UNetModern every DoubleConv is Sequential(Conv, BN, ReLU, Conv, BN, ReLU);
-the ConvTranspose2d upsamplers and the final 1x1 conv have no BN.
+In UNetModern, every DoubleConv is Sequential(Conv, BN, ReLU, Conv, BN, ReLU).
+The ConvTranspose2d upsampling layers and the final 1x1 conv have no BN.
 """
 
 import copy
@@ -21,14 +23,14 @@ import torch.nn as nn
 
 @torch.no_grad()
 def fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
-    """Return a new Conv2d equal to bn(conv(x)) in eval mode."""
+    """Return a new Conv2d that gives the same result as bn(conv(x)) in eval mode."""
     if conv.out_channels != bn.num_features:
         raise ValueError("Conv output channels and BatchNorm features differ.")
     if bn.running_mean is None or bn.running_var is None:
         raise ValueError("BatchNorm has no running statistics to fold.")
 
     dtype = conv.weight.dtype
-    # Compute in FP64 so the folding itself adds no measurable rounding.
+    # We compute in FP64, so the folding step itself adds almost no rounding error.
     weight = conv.weight.double()
     bias = conv.bias.double() if conv.bias is not None else torch.zeros_like(bn.running_mean, dtype=torch.float64)
     gamma = bn.weight.double() if bn.affine else torch.ones_like(bias)
@@ -54,10 +56,13 @@ def fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
 
 
 def fold_batchnorm(model: nn.Module) -> nn.Module:
-    """Return an eval-mode copy of `model` with every Conv2d -> BatchNorm2d
-    pair inside an nn.Sequential folded (BN replaced by nn.Identity).
+    """Return an eval-mode copy of `model` where BatchNorm is folded.
 
-    The original model is not modified.
+    We look inside every nn.Sequential for a Conv2d that is followed by a
+    BatchNorm2d. We fold each such pair into one Conv2d and replace the
+    BatchNorm with nn.Identity (a layer that does nothing).
+
+    The original model does not change.
     """
     folded_model = copy.deepcopy(model).eval()
     folded_count = 0

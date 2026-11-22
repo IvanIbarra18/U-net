@@ -1,10 +1,10 @@
-"""Hardware / software environment of an experiment.
+"""The hardware and software environment of an experiment.
 
-Every low-precision result depends on the exact stack it ran on: the same
-format can be native on one GPU and emulated (or unavailable) on another,
-and TensorRT engines are only valid for the GPU and TensorRT version that
-built them. environment_info() collects that stack so it can be stored next
-to each result.
+Every low-precision result depends on the exact hardware and software it ran
+on. The same number format can run natively on one GPU, but be emulated or
+not available at all on another GPU. Also, a TensorRT engine only works with
+the GPU and the TensorRT version that built it. environment_info() collects
+all this information, so we can save it next to each result.
 
 Usage (from the repository root):
     python -m quantization.env_report
@@ -21,7 +21,7 @@ import torch
 def _version(module_name: str):
     try:
         return getattr(importlib.import_module(module_name), "__version__", "unknown")
-    except Exception:  # not installed, or fails to load (missing DLLs, ...)
+    except Exception:  # not installed, or it fails to load (for example, missing DLLs)
         return None
 
 
@@ -39,7 +39,7 @@ def _driver_version():
 
 
 def environment_info(device_index: int = 0) -> dict:
-    """Flat dict of versions and GPU capabilities (JSON/CSV friendly)."""
+    """Return a flat dict of versions and GPU features (easy to save as JSON or CSV)."""
     info = {
         "os": platform.platform(),
         "python": sys.version.split()[0],
@@ -61,7 +61,7 @@ def environment_info(device_index: int = 0) -> dict:
         info["gpu"] = props.name
         info["compute_capability"] = f"{props.major}.{props.minor}"
         info["gpu_memory_mib"] = props.total_memory // 2 ** 20
-        # A PyTorch build without kernels for this GPU fails at the first op.
+        # If this PyTorch build has no kernels for this GPU, it fails at the first operation.
         sm = f"sm_{props.major}{props.minor}"
         info["torch_supports_gpu"] = sm in torch.cuda.get_arch_list()
     return info
