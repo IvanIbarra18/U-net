@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--validation","-v",type=float,default=10.0,help="Percentage of samples reserved for validation (0-100).",)
     parser.add_argument("--precision",type=lambda value: value.upper(),choices=["FP32", "FP16", "BF16"],default="FP32",help="Requested training precision; AMP will be used in the training loop.",)
     parser.add_argument("--cast",type=lambda value: value.upper(),choices=["FP16", "BF16"],default=None,help=("Train with the whole model (weights, gradients, Adam state, BatchNorm buffers) and its inputs in this dtype, ""without FP32 master weights or autocast. Experiment to compare against AMP (--precision); ""small weight updates can be lost to rounding. FP16 also uses dynamic loss scaling ""(utilis/fp16_scaler.py) against gradient underflow; BF16 has FP32's exponent range and does not need it."),)
+    parser.add_argument("--tf32",type=str.lower,choices=["on", "off"],default="off",help=("Allow TF32 (10-bit mantissa inputs) in FP32 convolutions and matmuls on Ampere+ GPUs. ""Default off: FP32 training is true FP32. PyTorch's own default turns TF32 on for cuDNN convolutions."),)
     parser.add_argument("--crop",nargs="+",type=int,default=[512],metavar="N",help="Crop size: --crop N or --crop H W.",)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument('--lr', type=float, default=0.0001, metavar='LR',help='learning rate (default: 0.0001)')
@@ -177,12 +178,19 @@ def main():
     # Label used in names and logs: "BF16-cast" (whole model) vs "BF16" (AMP).
     precision_label = f"{args.cast}-cast" if args.cast else args.precision
     print(f"Requested precision: {precision_label}"+ (f" (whole model in {args.cast}, no FP32 master weights)" if args.cast else ""))
+    print(f"TF32: {args.tf32}")
     print(f"DataLoader workers: {args.num_workers}; pin_memory={pin_memory}")
     print(f"Training batches per epoch: {len(train_loader)}")
     print(f"Validation batches per epoch: {len(val_loader)}\n")
 
     # 6. Select the training device.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # TF32 only changes FP32 convolutions and matmuls (AMP/--cast FP16 and BF16
+    # kernels are not affected). Set both flags here, so the run does not depend
+    # on PyTorch's defaults (cuDNN convolutions: on, matmuls: off).
+    torch.backends.cudnn.allow_tf32 = args.tf32 == "on"
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32 == "on"
 
     # Initialize performance logger
     performance_logger = PerformanceLogger(
