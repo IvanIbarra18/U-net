@@ -1,7 +1,7 @@
-"""Unit tests for quantization/int8.py (standard library unittest).
+"""Unit tests for quantization/int8.py (with unittest from the standard library).
 
 Run from the repository root:
-    python -m unittest quantization.test_int8 -v
+    python -m unittest tests.test_int8 -v
 """
 
 import unittest
@@ -33,7 +33,7 @@ class TestScaleQuantization(unittest.TestCase):
         self.assertAlmostEqual(dequantize(x_q, scale).item(), 31 / 254, places=6)
 
     def test_integer_range_is_symmetric(self):
-        # Values far outside the range saturate at +-127; -128 never appears.
+        # Values far outside the range saturate at +-127. -128 never appears.
         x = torch.linspace(-10, 10, 10001)
         x_q, _ = quantize(x, torch.tensor(1.0))
         self.assertEqual(x_q.dtype, torch.int8)
@@ -41,7 +41,7 @@ class TestScaleQuantization(unittest.TestCase):
         self.assertEqual(x_q.max().item(), QMAX)
 
     def test_rounding_error_bound(self):
-        # Inside [-amax, amax] the error is at most half a step: amax / 254.
+        # Inside [-amax, amax], the error is at most half a step: amax / 254.
         amax = torch.tensor(3.0)
         x = (torch.rand(100_000) * 2 - 1) * amax
         error = (x - fake_quantize(x, amax)).abs().max().item()
@@ -53,7 +53,7 @@ class TestScaleQuantization(unittest.TestCase):
         torch.testing.assert_close(fake_quantize(x, amax), torch.tensor([-1.0, -1.0, 1.0, 1.0]))
 
     def test_grid_values_are_exact(self):
-        # A value already on the grid survives quantize/dequantize unchanged.
+        # A value that is already on the grid does not change after quantize and dequantize.
         amax = torch.tensor(2.0)
         grid = torch.arange(-QMAX, QMAX + 1, dtype=torch.float32) / compute_scale(amax)
         torch.testing.assert_close(fake_quantize(grid, amax), grid, rtol=0, atol=1e-7)
@@ -85,7 +85,7 @@ class TestPerChannel(unittest.TestCase):
         self.assertEqual(list(amax.shape), [weight.shape[d] if d == axis else 1 for d in range(4)])
         x_q, _ = quantize(weight, amax)
         reduce_dims = [d for d in range(4) if d != axis]
-        # Max calibration: in every output channel the largest |w| maps to 127.
+        # Max calibration: in every output channel, the largest |w| maps to 127.
         per_channel_max = x_q.abs().amax(dim=reduce_dims).to(torch.int32)
         self.assertTrue(torch.all(per_channel_max == QMAX))
 
@@ -93,12 +93,12 @@ class TestPerChannel(unittest.TestCase):
         self._check_each_channel_reaches_qmax(torch.nn.Conv2d(16, 32, 3))
 
     def test_conv_transpose_output_channels(self):
-        # Weight is [C_in, C_out, kH, kW]: per-output-channel means axis 1.
+        # The weight is [C_in, C_out, kH, kW], so per output channel means axis 1.
         self._check_each_channel_reaches_qmax(torch.nn.ConvTranspose2d(32, 16, 2, stride=2))
 
     def test_per_channel_beats_per_tensor_with_uneven_channels(self):
-        # Channels with very different magnitudes (as after BN folding):
-        # one scale for the whole tensor wastes resolution on small channels.
+        # Channels with very different sizes (like after BN folding). One scale
+        # for the whole tensor wastes resolution on the small channels.
         weight = torch.randn(32, 16, 3, 3) * torch.logspace(-3, 0, 32).view(32, 1, 1, 1)
         per_tensor = quantization_error(weight, compute_amax(weight))
         per_channel = quantization_error(weight, compute_amax(weight, axis=0))

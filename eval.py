@@ -100,6 +100,7 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
     """Evaluate a model and return average loss and Dice, with optional loss components."""
 
     model.eval()
+    model_dtype = next(model.parameters()).dtype
 
     # Accumulate on the device to avoid a CPU/GPU sync per batch.
     loss_sum = torch.zeros((), device=device)
@@ -126,6 +127,9 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
                     device,
                     non_blocking=pin_memory,
                 )
+                # Use the model's dtype (BF16 for train.py --cast; nothing changes
+                # in FP32). Below, Loss and Dice are computed on FP32 logits.
+                images = images.to(model_dtype)
                 masks = batch["mask"].to(
                     device,
                     non_blocking=pin_memory,
@@ -141,6 +145,7 @@ def evaluate(model,dataloader,criterion,device,epoch,total_epochs,pin_memory=Fal
                     logits = predict_with_tta(model, images)
                 else:
                     logits = model(images)
+                logits = logits.float()
 
                 if collect_inference_timing:
                     if device.type == "cuda":

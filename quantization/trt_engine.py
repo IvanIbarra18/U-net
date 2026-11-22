@@ -3,24 +3,26 @@
 Pipeline:  checkpoint --export_onnx.py--> ONNX --build_engine()--> engine
            test.py --backend tensorrt runs the engine through TensorRTModel.
 
-Precision is decided by the ONNX graph, not by TensorRT. The network is
-created STRONGLY_TYPED: every tensor keeps the dtype written in the graph
-(FP32 now; INT8/FP8/... later through explicit Q/DQ nodes), and TensorRT may
-not pick a lower precision on its own. (TensorRT 11 removed the FP16/INT8
-builder flags entirely; in TensorRT 10 strong typing is opt-in.)
+The ONNX graph decides the precision, not TensorRT. We create the network as
+STRONGLY_TYPED. This means every tensor keeps the dtype written in the graph
+(FP32, or INT8, FP8 and others through explicit Q/DQ nodes), and TensorRT is
+not allowed to choose a lower precision by itself. (TensorRT 11 removed the
+FP16 and INT8 builder flags completely. In TensorRT 10, strong typing is
+optional and you must turn it on.)
 
-TF32: TensorRT enables it by default for FP32 convolutions, like cuDNN.
-build_engine() disables it unless tf32=True, so an "FP32" engine is FP32.
+TF32: like cuDNN, TensorRT turns it on by default for FP32 convolutions.
+build_engine() turns it off unless tf32=True, so an "FP32" engine really is FP32.
 
-What actually ran is read back from the built engine with the engine
-inspector (layer types, input/output dtypes and kernel "tactic" names, e.g.
-sm80_xmma_fprop_implicit_gemm_f32f32_f32f32_f32 = FP32 inputs, FP32
-accumulation, FP32 output). It is stored next to the engine as JSON and
-summarized in the results, so a precision is never claimed without evidence.
+We do not guess what really ran. We read it back from the built engine with
+the engine inspector: layer types, input and output dtypes, and kernel
+"tactic" names. For example, sm80_xmma_fprop_implicit_gemm_f32f32_f32f32_f32
+means FP32 inputs, FP32 sums and FP32 output. We save this as JSON next to
+the engine and summarize it in the results, so we never claim a precision
+without proof.
 
-Engines are specific to the GPU model and TensorRT version that built them,
-so they are cached per (ONNX hash, GPU, TensorRT, profile, TF32) and rebuilt
-on the cluster.
+An engine only works on the GPU model and TensorRT version that built it.
+So we cache one engine for each (ONNX hash, GPU, TensorRT, profile, TF32),
+and we build them again on the cluster.
 """
 
 import collections
@@ -35,19 +37,19 @@ import torch
 from quantization.env_report import environment_info
 from quantization.export_onnx import sha256
 
-# Layer types that do the convolution work (names used by the inspector).
+# Layer types that do the convolution work (these are the names the inspector uses).
 COMPUTE_LAYER_TYPES = {"correlation", "convolution", "deconv", "deconvolution", "gemm", "matrix_multiply"}
 
 
 def _trt():
-    import tensorrt  # imported lazily: PyTorch-only runs must not need it
+    import tensorrt  # imported only when needed, so runs that use only PyTorch do not need it
 
     return tensorrt
 
 
 def engine_path_for(onnx_path: Path, profile: dict, tf32: bool) -> Path:
-    """Cache file name: one engine per ONNX file, GPU, TensorRT version,
-    shape profile and TF32 setting."""
+    """Return the cache file name. There is one engine for each ONNX file,
+    GPU, TensorRT version, shape profile and TF32 setting."""
     trt = _trt()
     gpu = re.sub(r"[^A-Za-z0-9]+", "-", torch.cuda.get_device_name()).strip("-")
     (min_h, min_w), _, (max_h, max_w) = profile["min"], profile["opt"], profile["max"]
@@ -59,9 +61,10 @@ def engine_path_for(onnx_path: Path, profile: dict, tf32: bool) -> Path:
 
 
 def build_engine(onnx_path: Path, engine_path: Path, profile: dict, tf32: bool = False, n_channels: int = 3) -> Path:
-    """Parse the ONNX file into a strongly typed network and build an engine
-    for batch 1 and image sizes profile["min"] .. profile["max"] (H, W),
-    with kernels tuned for profile["opt"]."""
+    """Read the ONNX file into a strongly typed network and build an engine.
+
+    The engine is for batch size 1 and image sizes (H, W) from profile["min"]
+    to profile["max"]. Its kernels are tuned for profile["opt"]."""
     trt = _trt()
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -114,8 +117,10 @@ def build_engine(onnx_path: Path, engine_path: Path, profile: dict, tf32: bool =
 
 
 def get_engine(onnx_path: Path, profile: dict, tf32: bool = False, n_channels: int = 3, rebuild: bool = False) -> Path:
-    """Path to a cached engine for this configuration, building it if it is
-    missing, if `rebuild`, or if the ONNX file changed since it was built."""
+    """Return the path to a cached engine for these settings.
+
+    We build the engine if it does not exist, if `rebuild` is True, or if the
+    ONNX file changed after the engine was built."""
     engine_path = engine_path_for(onnx_path, profile, tf32)
     metadata_path = engine_path.with_suffix(".json")
     if not rebuild and engine_path.is_file() and metadata_path.is_file():
@@ -127,13 +132,14 @@ def get_engine(onnx_path: Path, profile: dict, tf32: bool = False, n_channels: i
 
 
 def inspect_layers(engine) -> list:
-    """Per-layer information of a built engine (needs DETAILED profiling
-    verbosity at build time): name, type, tactic and tensor dtypes."""
+    """Return information for each layer of a built engine: name, type,
+    tactic and tensor dtypes. (The engine must be built with DETAILED
+    profiling verbosity.)"""
     trt = _trt()
     info = json.loads(engine.create_engine_inspector().get_engine_information(trt.LayerInformationFormat.JSON))
     layers = []
     for layer in info["Layers"]:
-        if not isinstance(layer, dict):  # verbosity too low: only names
+        if not isinstance(layer, dict):  # verbosity was too low, so we only have names
             layers.append({"name": layer})
             continue
         layers.append({
@@ -146,26 +152,31 @@ def inspect_layers(engine) -> list:
     return layers
 
 
-# Kernel names spell out their dtypes, e.g. ..._i8i8_i8i32_f32_... =
-# activation in i8, out i8 | weights i8, accumulator i32 | epilogue f32.
+# Kernel names include their dtypes. For example, ..._i8i8_i8i32_f32_... means:
+# activation in i8 and output in i8, weights in i8 and sums (accumulator) in
+# i32, and the final step (epilogue) in f32.
 _DT = r"i8|i4|f16|bf16|tf32|f32|e4m3|e5m2|e2m1|fp8|fp4"
 _KERNEL_DTYPES = re.compile(rf"_(?P<input>{_DT})(?P<output>{_DT})_(?P<weight>{_DT})_?(?P<accumulator>i32|f32|f16)_")
 
 
 def kernel_dtypes(tactic: str) -> dict | None:
-    """{input, output, weight, accumulator} parsed from a tactic name, or None."""
+    """Read {input, output, weight, accumulator} from a tactic name.
+
+    Return None if the name does not match."""
     match = _KERNEL_DTYPES.search(tactic or "")
     return match.groupdict() if match else None
 
 
 def summarize_layers(layers: list) -> dict:
-    """What precision did the convolutions actually run in?
+    """Answer the question: in what precision did the convolutions really run?
 
-    compute_layers  conv/deconv layers by (input dtype -> output dtype)
-                    as reported by the engine inspector;
-    weights /       conv/deconv layers by weight dtype and accumulator dtype
-    accumulators    parsed from the kernel names ("unparsed" if unknown);
-    tf32_tactics    kernels whose name says TF32 (0 when TF32 is off).
+    compute_layers  conv and deconv layers counted by (input dtype -> output
+                    dtype), as the engine inspector reports them.
+    weights,        conv and deconv layers counted by weight dtype and by
+    accumulators    accumulator dtype, read from the kernel names
+                    ("unparsed" if we cannot read them).
+    tf32_tactics    the number of kernels whose name says TF32 (0 when TF32
+                    is off).
     """
     compute = [layer for layer in layers if layer.get("type") in COMPUTE_LAYER_TYPES]
     by_dtype = collections.Counter(
@@ -183,12 +194,12 @@ def summarize_layers(layers: list) -> dict:
 
 
 class TensorRTModel:
-    """Callable like a PyTorch model: FP32 CUDA images [1, C, H, W] -> logits.
+    """You can call this like a PyTorch model: FP32 CUDA images [1, C, H, W] -> logits.
 
-    The execution context uses USER_MANAGED device memory taken from a
-    PyTorch tensor, so torch.cuda.max_memory_allocated() includes TensorRT's
-    activation memory. The engine weights themselves are allocated by
-    TensorRT and are reported separately (engine size).
+    The execution context uses USER_MANAGED device memory that comes from a
+    PyTorch tensor. So torch.cuda.max_memory_allocated() includes the memory
+    that TensorRT uses for activations. TensorRT allocates the engine weights
+    itself, so we report them separately (as the engine size).
     """
 
     def __init__(self, engine_path: Path):
@@ -203,7 +214,7 @@ class TensorRTModel:
         self.input_name = next(n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
         self.output_name = next(n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
         self.stream = torch.cuda.Stream()
-        self.workspace = None  # grown on demand, never shrunk
+        self.workspace = None  # it grows when needed and never gets smaller
         self.engine_bytes = self.engine_path.stat().st_size
         self.metadata = json.loads(self.engine_path.with_suffix(".json").read_text(encoding="utf-8"))
 
@@ -215,34 +226,35 @@ class TensorRTModel:
             raise ValueError(f"Input shape {tuple(images.shape)} is outside the engine profile {self.metadata['profile']}.")
         needed = self.context.update_device_memory_size_for_shapes()
         if self.workspace is None or self.workspace.numel() < needed:
-            self.workspace = None  # free the old buffer before allocating
+            self.workspace = None  # free the old buffer before we allocate a new one
             self.workspace = torch.empty(max(needed, 1), dtype=torch.uint8, device=images.device)
         self.context.set_device_memory(self.workspace.data_ptr(), self.workspace.numel())
 
         logits = torch.empty(tuple(self.context.get_tensor_shape(self.output_name)), dtype=torch.float32, device=images.device)
         self.context.set_tensor_address(self.input_name, images.data_ptr())
         self.context.set_tensor_address(self.output_name, logits.data_ptr())
-        # Order the engine after the work that produced `images`, and later
-        # work after the engine, without a full device synchronization.
+        # The engine must wait for the work that made `images`, and later work
+        # must wait for the engine. We do this without syncing the whole device.
         current = torch.cuda.current_stream(images.device)
         self.stream.wait_stream(current)
         if not self.context.execute_async_v3(self.stream.cuda_stream):
             raise RuntimeError("TensorRT execution failed.")
         current.wait_stream(self.stream)
         for tensor in (images, logits, self.workspace):
-            tensor.record_stream(self.stream)  # not reused while the engine may still read them
+            tensor.record_stream(self.stream)  # not reused while the engine may still read it
         return logits
 
     def layer_summary(self) -> dict:
-        # Recomputed from the saved per-layer file, so engines cached before
-        # a summary field was added still report it.
+        # We compute this again from the saved per-layer file. This way, engines
+        # cached before we added a summary field still report that field.
         layers_path = self.engine_path.with_suffix(".layers.json")
         return summarize_layers(json.loads(layers_path.read_text(encoding="utf-8")))
 
 
 def profile_from_sizes(sizes) -> dict:
-    """Optimization profile covering every (H, W) in `sizes`; kernels are
-    tuned for the most frequent size."""
+    """Return an optimization profile that covers every (H, W) in `sizes`.
+
+    The kernels are tuned for the most common size."""
     sizes = list(sizes)
     heights = [h for h, _ in sizes]
     widths = [w for _, w in sizes]

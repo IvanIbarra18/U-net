@@ -1,7 +1,7 @@
 """Unit tests for activation calibration and input quantizers.
 
 Run from the repository root:
-    python -m unittest quantization.test_calibrate -v
+    python -m unittest tests.test_calibrate -v
 """
 
 import unittest
@@ -13,7 +13,7 @@ from models.unet_modern import UNetModern
 from quantization.calibrate import InputObserver, amax_from_entropy, amax_from_percentile, kl_divergence, without_zeros
 from quantization.int8 import compute_scale, fake_quantize, fake_quantize_
 from quantization.quantize_model import attach_input_quantizers, prepare_int8_model, quantizable_layers
-from quantization.test_bn_fold import randomize_bn
+from tests.test_bn_fold import randomize_bn
 
 
 def histogram(values: np.ndarray, bins: int = 2048):
@@ -38,8 +38,8 @@ class TestThresholds(unittest.TestCase):
         self.assertEqual(kl_divergence(p, np.array([1.0, 0.0, 3.0])), float("inf"))
 
     def test_entropy_clips_rare_outliers(self):
-        # Gaussian bulk plus a handful of huge outliers: max calibration is
-        # dominated by the outliers, entropy should clip them.
+        # Mostly Gaussian data, plus a few huge outliers. Max calibration is
+        # controlled by the outliers, but entropy should clip them.
         values = np.concatenate([self.rng.normal(0, 1, 2_000_000), [60.0, -55.0, 58.0]])
         hist, edges = histogram(values)
         amax, divergences = amax_from_entropy(hist, edges)
@@ -48,7 +48,7 @@ class TestThresholds(unittest.TestCase):
         self.assertTrue(np.isfinite(divergences.min()))
 
     def test_entropy_keeps_range_without_outliers(self):
-        # Uniform data has no tail worth clipping: keep (almost) all of it.
+        # Uniform data has no long tail to clip, so we keep almost all of it.
         hist, edges = histogram(self.rng.uniform(0, 1, 2_000_000))
         amax, _ = amax_from_entropy(hist, edges)
         self.assertGreater(amax, 0.9)
@@ -56,7 +56,7 @@ class TestThresholds(unittest.TestCase):
 
 class TestZeroSpike(unittest.TestCase):
     def test_skip_zeros_avoids_overclipping(self):
-        # ReLU-like data: half exact zeros, the rest |N(0, 1)|.
+        # Data like after a ReLU: half of it is exact zeros, and the rest is |N(0, 1)|.
         rng = np.random.default_rng(0)
         bulk = np.abs(rng.normal(0, 1, 1_000_000))
         values = np.concatenate([np.zeros(1_000_000), bulk])
@@ -64,7 +64,7 @@ class TestZeroSpike(unittest.TestCase):
         plain, _ = amax_from_entropy(hist, edges)
         skipped, _ = amax_from_entropy(without_zeros(hist, 1_000_000), edges)
         clipped = lambda amax: (bulk > amax).mean()
-        # The zero spike makes plain entropy clip much more of the bulk.
+        # Because of the spike at zero, plain entropy clips much more of the main data.
         self.assertGreater(clipped(plain), 5 * clipped(skipped))
         self.assertLess(clipped(skipped), 0.01)
 
@@ -104,7 +104,7 @@ class TestInputQuantizers(unittest.TestCase):
         torch.testing.assert_close(fake_quantize_(x.clone(), amax), fake_quantize(x, amax), rtol=0, atol=0)
 
     def test_inplace_hooks_match_reference(self):
-        # In-place quantization must not corrupt tensors reused later (skips).
+        # In-place quantization must not damage tensors that are used again later (skips).
         inplace, _ = prepare_int8_model(self.model, act_amax=self.amax, inplace=True)
         reference, _ = prepare_int8_model(self.model, act_amax=self.amax, inplace=False)
         x = torch.rand(1, 3, 64, 64)
@@ -115,7 +115,7 @@ class TestInputQuantizers(unittest.TestCase):
         quantized, _ = prepare_int8_model(self.model, act_amax=self.amax, fp_layers=["segment"])
         seen = {}
         for name, module in quantizable_layers(quantized).items():
-            # Registered after the quantizer hook, so it sees the quantized input.
+            # We register this after the quantizer hook, so it sees the quantized input.
             module.register_forward_pre_hook(lambda m, a, name=name: seen.__setitem__(name, a[0].clone()))
         with torch.no_grad():
             quantized(torch.rand(1, 3, 64, 64))
@@ -129,7 +129,7 @@ class TestInputQuantizers(unittest.TestCase):
         del self.amax["up1"]
         with self.assertRaises(ValueError):
             prepare_int8_model(self.model, act_amax=self.amax)
-        # Fine if that layer stays in FP.
+        # This is fine if that layer stays in FP.
         prepare_int8_model(self.model, act_amax=self.amax, fp_layers=["up1"])
 
 

@@ -1,7 +1,7 @@
 """Tests for the TensorRT path (skipped without CUDA or TensorRT).
 
 Run from the repository root:
-    python -m unittest quantization.test_trt_engine -v
+    python -m unittest tests.test_trt_engine -v
 """
 
 import importlib.util
@@ -14,7 +14,7 @@ import torch
 from models.unet_modern import UNetModern
 from quantization.bn_fold import fold_batchnorm
 from quantization.export_onnx import export_onnx
-from quantization.test_bn_fold import randomize_bn
+from tests.test_bn_fold import randomize_bn
 from quantization.trt_engine import TensorRTModel, get_engine, profile_from_sizes
 
 HAS_TRT = torch.cuda.is_available() and importlib.util.find_spec("tensorrt") is not None
@@ -28,7 +28,7 @@ class TestProfile(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TRT, "needs CUDA and TensorRT")
 class TestEngine(unittest.TestCase):
-    """Small U-Net -> ONNX -> FP32 engine (TF32 off) -> same output as PyTorch."""
+    """Small U-Net -> ONNX -> FP32 engine (TF32 off). The output must match PyTorch."""
 
     @classmethod
     def setUpClass(cls):

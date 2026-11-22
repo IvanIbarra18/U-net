@@ -6,18 +6,21 @@ from pathlib import Path
 import random
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 import torch.backends.cudnn as cudnn
 from torch import cuda, optim
 from torch.utils.data import DataLoader, Subset
 from prefetch_generator import BackgroundGenerator
 from models.unet_classic import UNetClassic
 from models.unet_modern import UNetModern
+from utilis.fp16_scaler import FP16ParamGradScaler
 from utilis.loss import DiceBCELoss
-from utilis.metrics import (
+from utilis.metrics import dice_score
+from utilis.reporting import (
     append_experiment_metrics,
-    dice_score,
+    epoch_row,
     initialize_experiment_metrics,
+    peak_gpu_memory_mib,
+    plot_training_history,
 )
 from utilis.checkpoint import (
     capture_rng_state,
@@ -61,6 +64,7 @@ def parse_args():
     parser.add_argument("--num-workers", "-j", type=int, default=min(4, os.cpu_count() or 1),help="DataLoader worker processes (default: min(4, CPU count)).",)
     parser.add_argument("--validation","-v",type=float,default=10.0,help="Percentage of samples reserved for validation (0-100).",)
     parser.add_argument("--precision",type=lambda value: value.upper(),choices=["FP32", "FP16", "BF16"],default="FP32",help="Requested training precision; AMP will be used in the training loop.",)
+    parser.add_argument("--cast",type=lambda value: value.upper(),choices=["FP16", "BF16"],default=None,help=("Train with the whole model (weights, gradients, Adam state, BatchNorm buffers) and its inputs in this dtype, ""without FP32 master weights or autocast. Experiment to compare against AMP (--precision); ""small weight updates can be lost to rounding. FP16 also uses dynamic loss scaling ""(utilis/fp16_scaler.py) against gradient underflow; BF16 has FP32's exponent range and does not need it."),)
     parser.add_argument("--crop",nargs="+",type=int,default=[512],metavar="N",help="Crop size: --crop N or --crop H W.",)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument('--lr', type=float, default=0.0001, metavar='LR',help='learning rate (default: 0.0001)')
@@ -82,6 +86,10 @@ def parse_args():
         parser.error("--validation must be in [0, 100)")
     if len(args.crop) not in (1, 2) or any(size <= 0 for size in args.crop):
         parser.error("--crop requires one or two positive integers")
+    if args.cast is not None and args.precision != "FP32":
+        parser.error("--cast (whole model in BF16) and --precision (AMP) are separate experiments; use only one.")
+    if args.cast is not None and not torch.cuda.is_available():
+        parser.error("--cast training needs a CUDA GPU.")
 
     # Convert one crop dimension into a square (H, W) tuple.
     args.crop_size = (
@@ -166,7 +174,9 @@ def main():
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Batch size: {args.batch_size}")
     print(f"Crop size: {args.crop_size}")
-    print(f"Requested precision: {args.precision}")
+    # Label used in names and logs: "BF16-cast" (whole model) vs "BF16" (AMP).
+    precision_label = f"{args.cast}-cast" if args.cast else args.precision
+    print(f"Requested precision: {precision_label}"+ (f" (whole model in {args.cast}, no FP32 master weights)" if args.cast else ""))
     print(f"DataLoader workers: {args.num_workers}; pin_memory={pin_memory}")
     print(f"Training batches per epoch: {len(train_loader)}")
     print(f"Validation batches per epoch: {len(val_loader)}\n")
@@ -180,7 +190,7 @@ def main():
         device=device,
         experiment_name=(
             f"{args.dataset}_"
-            f"{args.precision}_"
+            f"{precision_label}_"
             f"{args.split if args.split is not None else f'seed{args.seed}'}"
         ),
         synchronize_cuda=True,
@@ -221,12 +231,16 @@ def main():
             batch_norm=True,
         ).to(device)
 
+    # Whole-model FP16/BF16: every parameter and buffer is converted once, so
+    # gradients and the Adam state (created like the parameters) follow.
+    if args.cast is not None:
+        model = model.to(dtype={"FP16": torch.float16, "BF16": torch.bfloat16}[args.cast])
+    model_dtype = next(model.parameters()).dtype
+
     weights_mib = sum(
         tensor.numel() * tensor.element_size()
         for tensor in list(model.parameters()) + list(model.buffers())
     ) / (1024 ** 2)
-
-
 
     # Count model parameters.
     total_params = sum(p.numel() for p in model.parameters())
@@ -245,8 +259,12 @@ def main():
 
     amp_dtype = {"FP16": torch.float16,"BF16": torch.bfloat16,}.get(args.precision)
 
-    # GradScaler is used for FP16 training on CUDA.
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "FP16"),)
+    # GradScaler is used for FP16 training on CUDA: AMP FP16 (FP32 parameters)
+    # or --cast FP16 (FP16 parameters, which the stock GradScaler rejects).
+    if args.cast == "FP16":
+        scaler = FP16ParamGradScaler("cuda")
+    else:
+        scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "FP16"),)
 
     # 8. Define Dice + BCE and the optimizer.
     criterion = DiceBCELoss()
@@ -326,6 +344,7 @@ def main():
             for batch_idx, batch in enumerate(train_loader):
                 performance_logger.start_batch(batch_idx)
                 images = batch["image"].to(device, non_blocking=pin_memory)
+                images = images.to(model_dtype)  # no-op unless --cast
                 masks = batch["mask"].to(device, non_blocking=pin_memory)
                 optimizer.zero_grad(set_to_none=True)
 
@@ -398,16 +417,7 @@ def main():
         avg_val_loss = val_metrics["loss"]
         avg_val_dice = val_metrics["dice"]
         epoch_time_sec = time.perf_counter() - epoch_start_time
-        if device.type == "cuda":
-            peak_gpu_allocated_mib = (
-                torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-            )
-            peak_gpu_reserved_mib = (
-                torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-            )
-        else:
-            peak_gpu_allocated_mib = None
-            peak_gpu_reserved_mib = None
+        peak_gpu_allocated_mib, peak_gpu_reserved_mib = peak_gpu_memory_mib(device)
 
         history["train_loss"].append(avg_train_loss)
         history["train_dice"].append(avg_train_dice)
@@ -415,34 +425,22 @@ def main():
         history["val_dice"].append(avg_val_dice)
 
         if experiment_csv is not None:
-            avg_train_components = {
-                name: total.item() / samples_seen
-                for name, total in train_component_sums.items()
+            train_summary = {
+                "loss": avg_train_loss,
+                "dice": avg_train_dice,
+                **{name: total.item() / samples_seen for name, total in train_component_sums.items()},
             }
-            append_experiment_metrics(experiment_csv, {
-                "epoch": epoch,
-                "model": args.model,
-                "total_params": total_params,
-                "train_loss": avg_train_loss,
-                "train_bce_loss": avg_train_components["bce_loss"],
-                "train_dice_loss": avg_train_components["dice_loss"],
-                "train_bce_contribution": avg_train_components["bce_contribution"],
-                "train_dice_contribution": avg_train_components["dice_contribution"],
-                "train_dice_score": avg_train_dice,
-                "val_loss": avg_val_loss,
-                "val_bce_loss": val_metrics["bce_loss"],
-                "val_dice_loss": val_metrics["dice_loss"],
-                "val_bce_contribution": val_metrics["bce_contribution"],
-                "val_dice_contribution": val_metrics["dice_contribution"],
-                "val_dice_score": avg_val_dice,
+            performance = {
                 "epoch_time_sec": epoch_time_sec,
                 "train_images_per_sec": train_performance["images_per_second"],
-                "latency_ms_per_image": val_metrics["latency_ms_per_image"],
-                "throughput_images_per_sec": val_metrics["throughput_images_per_sec"],
                 "weights_mib": weights_mib,
                 "peak_gpu_allocated_mib": peak_gpu_allocated_mib,
                 "peak_gpu_reserved_mib": peak_gpu_reserved_mib,
-            })
+            }
+            append_experiment_metrics(
+                experiment_csv,
+                epoch_row(epoch, args.model, total_params, train_summary, val_metrics, performance),
+            )
 
         print(f"Epoch {epoch}/{args.epochs} complete | "
               f"Train Loss: {avg_train_loss:.4f} | "
@@ -485,34 +483,7 @@ def main():
     print(f"Best validation loss: {best_val_loss:.4f}")
     writer.close()
 
-    if history["train_loss"]:
-        epochs = range(1, len(history["train_loss"]) + 1)
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-
-        axes[0, 0].plot(epochs, history["train_loss"], "b-o", markersize=3)
-        axes[0, 0].set_title("Training loss")
-        axes[0, 0].set_ylabel("Loss")
-
-        axes[0, 1].plot(epochs, history["train_dice"], "b-o", markersize=3)
-        axes[0, 1].set_title("Training Dice score")
-        axes[0, 1].set_ylabel("Dice score")
-
-        axes[1, 0].plot(epochs, history["val_loss"], "r-o", markersize=3)
-        axes[1, 0].set_title("Validation loss")
-        axes[1, 0].set_ylabel("Loss")
-
-        axes[1, 1].plot(epochs, history["val_dice"], "r-o", markersize=3)
-        axes[1, 1].set_title("Validation Dice score")
-        axes[1, 1].set_ylabel("Dice score")
-
-        for axis in axes.flat:
-            axis.set_xlabel("Epoch")
-            axis.grid(alpha=0.3)
-
-        fig.tight_layout()
-        if experiment_csv is not None:
-            fig.savefig(experiment_csv.with_suffix(".png"))
-        plt.show()
+    plot_training_history(history,save_path=experiment_csv.with_suffix(".png") if experiment_csv is not None else None,)
 
 if __name__ == "__main__":
     main()

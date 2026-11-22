@@ -1,7 +1,7 @@
 """Unit tests for quantization/quantize_model.py.
 
 Run from the repository root:
-    python -m unittest quantization.test_quantize_model -v
+    python -m unittest tests.test_quantize_model -v
 """
 
 import unittest
@@ -12,11 +12,11 @@ import torch.nn as nn
 from models.unet_modern import UNetModern
 from quantization.int8 import QMAX, compute_amax, compute_scale, weight_axis
 from quantization.quantize_model import prepare_int8_model, quantizable_layers
-from quantization.test_bn_fold import randomize_bn
+from tests.test_bn_fold import randomize_bn
 
 
 def is_on_int8_grid(module) -> bool:
-    """Every weight equals k / s_c with integer k in [-127, 127]."""
+    """Check that every weight equals k / s_c, with an integer k in [-127, 127]."""
     weight = module.weight.detach()
     scale = compute_scale(compute_amax(weight, axis=weight_axis(module)))
     levels = weight * scale
@@ -51,7 +51,7 @@ class TestPrepareInt8(unittest.TestCase):
             self.assertTrue(torch.equal(value, original[key]), key)
 
     def test_requantizing_is_idempotent(self):
-        # Values already on the grid do not move when quantized again.
+        # Values that are already on the grid do not move when we quantize them again.
         quantized, _ = prepare_int8_model(self.model)
         again, _ = prepare_int8_model(quantized)
         for (name, a), (_, b) in zip(quantizable_layers(quantized).items(), quantizable_layers(again).items()):
@@ -61,9 +61,9 @@ class TestPrepareInt8(unittest.TestCase):
         quantized, stats = prepare_int8_model(self.model, fp_layers=["enc1.block.0", "segment"])
         self.assertEqual(len(stats), 21)
         layers = quantizable_layers(quantized)
-        # segment has no BN, so kept in FP it equals the original weight.
+        # segment has no BN, so when it stays in FP it equals the original weight.
         self.assertTrue(torch.equal(layers["segment"].weight, self.model.segment.weight))
-        # enc1.block.0 is BN-folded but not quantized: off the INT8 grid.
+        # enc1.block.0 is BN-folded but not quantized, so it is not on the INT8 grid.
         self.assertFalse(is_on_int8_grid(layers["enc1.block.0"]))
         self.assertTrue(is_on_int8_grid(layers["enc1.block.3"]))
 
