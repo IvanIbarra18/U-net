@@ -62,8 +62,13 @@ def environment_info(device_index: int = 0) -> dict:
         info["compute_capability"] = f"{props.major}.{props.minor}"
         info["gpu_memory_mib"] = props.total_memory // 2 ** 20
         # If this PyTorch build has no kernels for this GPU, it fails at the first operation.
-        sm = f"sm_{props.major}{props.minor}"
-        info["torch_supports_gpu"] = sm in torch.cuda.get_arch_list()
+        # Kernels built for an older GPU of the same generation also run (for example,
+        # sm_86 kernels run on an sm_89 L40S), so any sm_<major><minor or lower> counts.
+        built = [arch for arch in torch.cuda.get_arch_list() if arch.startswith("sm_")]
+        info["torch_supports_gpu"] = any(
+            arch[3:-1] == str(props.major) and int(arch[-1]) <= props.minor for arch in built
+            if arch[3:].isdigit()
+        )
     return info
 
 

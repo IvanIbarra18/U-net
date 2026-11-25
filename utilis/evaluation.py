@@ -47,7 +47,9 @@ def describe_precision(args, use_amp, model_format, trt_summary=None):
         tf32 = f", {trt_summary['tf32_tactics']} TF32 tactics" if trt_summary["tf32_tactics"] else ""
         representation = quant_modes.describe(args)
         storage = f"TensorRT engine, conv weights [{counts('weights')}]"
-        if args.quant != "NONE" and set(trt_summary["weights"]) == {"f32"}:
+        # "unparsed": kernels whose name does not say the weight dtype (some
+        # classic-builder kernels, for example on the L40S).
+        if args.quant != "NONE" and not set(trt_summary["weights"]) - {"f32", "unparsed"}:
             # Weight-only: the kernels get FP32 weights. The engine may keep the
             # weights compressed (and dequantize them at run time), or it may fold
             # them to FP32 when it is built. We find out by comparing the engine
