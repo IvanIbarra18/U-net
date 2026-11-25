@@ -1,7 +1,0 @@
-timestamp, index, name, utilization.gpu [%], utilization.memory [%], memory.used [MiB], memory.total [MiB], power.draw [W], temperature.gpu, clocks.current.graphics [MHz], clocks.current.memory [MHz]
-2026/11/23 21:22:08.404, 0, NVIDIA GeForce RTX 5080, 2 %, 18 %, 918 MiB, 16303 MiB, 12.43 W, 25.21, 450 MHz, 405 MHz
-2026/11/23 21:22:09.410, 0, NVIDIA GeForce RTX 5080, 1 %, 14 %, 918 MiB, 16303 MiB, 12.68 W, 25.21, 427 MHz, 405 MHz
-2026/11/23 21:22:10.416, 0, NVIDIA GeForce RTX 5080, 1 %, 19 %, 926 MiB, 16303 MiB, 12.70 W, 25.19, 382 MHz, 405 MHz
-2026/11/23 21:22:11.424, 0, NVIDIA GeForce RTX 5080, 1 %, 11 %, 939 MiB, 16303 MiB, 14.50 W, 25.21, 330 MHz, 405 MHz
-2026/11/23 21:22:12.427, 0, NVIDIA GeForce RTX 5080, 1 %, 17 %, 938 MiB, 16303 MiB, 12.29 W, 25.16, 382 MHz, 405 MHz
-2026/11/23 21:22:13.433, 0, NVIDIA GeForce RTX 5080, 1 %, 14 %, 930 MiB, 16303 MiB, 12.16 W, 25.16, 367 MHz, 405 MHz

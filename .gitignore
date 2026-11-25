@@ -15,6 +15,15 @@ ENV/
 /test_results/
 /exports/
 
+# Experiment outputs: logs, GPU metrics, environment reports and calibration files
+/outputs/
+/calibration/
+/plots/
+
+# SLURM job logs (written to the repository root on the cluster)
+*.out
+*.err
+
 # Ignore other dataset archives, but keep the archive intended for upload.
 *.zip
 !/datasets.zip

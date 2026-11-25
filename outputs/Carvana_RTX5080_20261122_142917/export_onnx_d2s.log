@@ -1,4 +1,0 @@
-W1123 21:22:17.093000 37204 venv\Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
-C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\copyreg.py:99: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
-  return cls.__new__(cls, *args)
-ONNX saved to: D:\U-net\exports\best_Carvana-Baseline-5080_fp32_bnfolded_d2s.onnx (118.5 MiB)
