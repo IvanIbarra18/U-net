@@ -1,0 +1,16 @@
+{
+  "os": "Windows-11-10.0.26300-SP0",
+  "python": "3.13.12",
+  "torch": "2.11.0+cu128",
+  "torch_cuda": "12.8",
+  "cudnn": 91900,
+  "torch_arch_list": "sm_75 sm_80 sm_86 sm_90 sm_100 sm_120",
+  "tensorrt": "11.4.0.106",
+  "onnx": "1.23.2",
+  "onnxruntime": null,
+  "driver": "621.24",
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "compute_capability": "12.0",
+  "gpu_memory_mib": 16275,
+  "torch_supports_gpu": true
+}

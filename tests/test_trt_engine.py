@@ -15,9 +15,35 @@ from models.unet_modern import UNetModern
 from quantization.bn_fold import fold_batchnorm
 from quantization.export_onnx import export_onnx
 from tests.test_bn_fold import randomize_bn
-from quantization.trt_engine import TensorRTModel, get_engine, profile_from_sizes
+from quantization.trt_engine import TensorRTModel, get_engine, layer_kind, profile_from_sizes, summarize_layers
 
 HAS_TRT = torch.cuda.is_available() and importlib.util.find_spec("tensorrt") is not None
+
+
+class TestLayerSummary(unittest.TestCase):
+    """The inspector names layers differently on different GPUs (Myelin vs the classic builder)."""
+
+    def test_layer_kind_both_namings(self):
+        for name in ("correlation", "CaskConvolution"):
+            self.assertEqual(layer_kind(name), "correlation", name)
+        for name in ("deconv", "CaskDeconvolutionV2", "CaskGemmDeconvolution"):
+            self.assertEqual(layer_kind(name), "deconv", name)
+        for name in ("kgen", "custom_layer", "maxpool", "CaskPooling", "Reformat", None):
+            self.assertIsNone(layer_kind(name), name)
+
+    def test_classic_builder_layers_are_counted(self):
+        # Shortened from a real L40S / TensorRT 11.5 engine.
+        f32 = {"inputs": ["Float"], "outputs": ["Float"]}
+        layers = [
+            {"type": "CaskConvolution", "tactic": "sm80_xmma_fprop_implicit_gemm_f32f32_f32f32_f32_nchwkcrs_nchw", **f32},
+            {"type": "CaskConvolution", "tactic": "ampere_scudnn_winograd_128x128_ldg1_ldg4_relu_tile148t_nt_v1", **f32},
+            {"type": "CaskPooling", "tactic": "sm50_xmma_pooling_tiled_FP32NCHW_kMAX", **f32},
+            {"type": "CaskGemmDeconvolution", "tactic": "", **f32},
+            {"type": "Reformat", "tactic": "", **f32},
+        ]
+        summary = summarize_layers(layers)
+        self.assertEqual(summary["compute_layers"], {"correlation:Float->Float": 2, "deconv:Float->Float": 1})
+        self.assertEqual(summary["weights"], {"f32": 1, "unparsed": 2})
 
 
 class TestProfile(unittest.TestCase):

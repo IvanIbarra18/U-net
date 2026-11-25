@@ -37,8 +37,21 @@ import torch
 from quantization.env_report import environment_info
 from quantization.export_onnx import sha256
 
-# Layer types that do the convolution work (these are the names the inspector uses).
-COMPUTE_LAYER_TYPES = {"correlation", "convolution", "deconv", "deconvolution", "gemm", "matrix_multiply"}
+# Layer types that do the convolution work. The inspector names them in two ways,
+# depending on how TensorRT compiled the graph (verified with TensorRT 11.4 / 11.5):
+#   Myelin (RTX 5080):        "correlation", "deconv"
+#   classic builder (L40S):   "CaskConvolution", "CaskDeconvolutionV2", "CaskGemmDeconvolution"
+# layer_kind() maps both to the same two names, so the reports look the same on every GPU.
+def layer_kind(layer_type) -> str | None:
+    """Return "correlation" (a convolution), "deconv", "gemm" or None (not a compute layer)."""
+    name = (layer_type or "").lower()
+    if "deconv" in name:
+        return "deconv"
+    if "conv" in name or name == "correlation":
+        return "correlation"
+    if "gemm" in name or "matrix_multiply" in name:
+        return "gemm"
+    return None
 
 
 def _trt():
@@ -178,9 +191,10 @@ def summarize_layers(layers: list) -> dict:
     tf32_tactics    the number of kernels whose name says TF32 (0 when TF32
                     is off).
     """
-    compute = [layer for layer in layers if layer.get("type") in COMPUTE_LAYER_TYPES]
+    compute = [layer for layer in layers if layer_kind(layer.get("type"))]
     by_dtype = collections.Counter(
-        f"{layer['type']}:{(layer['inputs'] or ['?'])[0]}->{(layer['outputs'] or ['?'])[0]}" for layer in compute
+        f"{layer_kind(layer['type'])}:{(layer['inputs'] or ['?'])[0]}->{(layer['outputs'] or ['?'])[0]}"
+        for layer in compute
     )
     parsed = [kernel_dtypes(layer.get("tactic", "")) for layer in compute]
     return {

@@ -180,6 +180,9 @@ def export_onnx(model: nn.Module, path: Path, n_channels: int, opset: int = OPSE
             input_names=["image"], output_names=["logits"],
             dynamic_shapes=({2: height, 3: width},),
             opset_version=opset, dynamo=True, external_data=False,
+            # No progress messages: they contain an emoji that a Windows console
+            # (cp1252) cannot print, and that error stops the export.
+            verbose=False,
         )
     return path
 

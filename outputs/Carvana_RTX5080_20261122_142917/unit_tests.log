@@ -1,0 +1,284 @@
+.................................................W1122 14:29:24.353000 21292 venv\Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+EEE.E......E.
+======================================================================
+ERROR: test_all_layers_fp8 (tests.test_qdq_onnx.TestFP8Engine.test_all_layers_fp8)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\U-net\tests\test_qdq_onnx.py", line 148, in test_all_layers_fp8
+    fp32 = export_onnx(model, Path(tmp) / "fp32_d2s.onnx", n_channels=3, upsample="depth2space")
+  File "D:\U-net\quantization\export_onnx.py", line 178, in export_onnx
+    torch.onnx.export(
+    ~~~~~~~~~~~~~~~~~^
+        wrapper, (example,), str(path),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        opset_version=opset, dynamo=True, external_data=False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\__init__.py", line 291, in export
+    return _compat.export_compat(
+           ~~~~~~~~~~~~~~~~~~~~~^
+        model,
+        ^^^^^^
+    ...<18 lines>...
+        artifacts_dir=artifacts_dir,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_compat.py", line 161, in export_compat
+    onnx_program = _core.export(
+        model,
+    ...<13 lines>...
+        opset_version=opset_version,
+    )
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_core.py", line 1376, in export
+    result = strategy(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 129, in __call__
+    self._success(model)
+    ~~~~~~~~~~~~~^^^^^^^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 253, in _success
+    self._verbose_print(
+    ~~~~~~~~~~~~~~~~~~~^
+        f"Obtain model graph for `{model_repr}` with `torch.export.export(..., strict=False)`... \u2705"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 31, in <lambda>
+    return lambda *args, **kwargs: print("[torch.onnx]", *args, **kwargs)
+                                   ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 95: character maps to <undefined>
+
+======================================================================
+ERROR: setUpClass (tests.test_qdq_onnx.TestFP8Graph)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\U-net\tests\test_qdq_onnx.py", line 95, in setUpClass
+    cls.fp32 = export_onnx(cls.model, Path(cls.tmp.name) / "fp32_d2s.onnx", n_channels=3, upsample="depth2space")
+               ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\U-net\quantization\export_onnx.py", line 178, in export_onnx
+    torch.onnx.export(
+    ~~~~~~~~~~~~~~~~~^
+        wrapper, (example,), str(path),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        opset_version=opset, dynamo=True, external_data=False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\__init__.py", line 291, in export
+    return _compat.export_compat(
+           ~~~~~~~~~~~~~~~~~~~~~^
+        model,
+        ^^^^^^
+    ...<18 lines>...
+        artifacts_dir=artifacts_dir,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_compat.py", line 161, in export_compat
+    onnx_program = _core.export(
+        model,
+    ...<13 lines>...
+        opset_version=opset_version,
+    )
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_core.py", line 1376, in export
+    result = strategy(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 129, in __call__
+    self._success(model)
+    ~~~~~~~~~~~~~^^^^^^^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 253, in _success
+    self._verbose_print(
+    ~~~~~~~~~~~~~~~~~~~^
+        f"Obtain model graph for `{model_repr}` with `torch.export.export(..., strict=False)`... \u2705"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 31, in <lambda>
+    return lambda *args, **kwargs: print("[torch.onnx]", *args, **kwargs)
+                                   ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 95: character maps to <undefined>
+
+======================================================================
+ERROR: setUpClass (tests.test_qdq_onnx.TestINT8Engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\U-net\tests\test_qdq_onnx.py", line 170, in setUpClass
+    fp32 = export_onnx(model, Path(cls.tmp.name) / "fp32.onnx", n_channels=3)
+  File "D:\U-net\quantization\export_onnx.py", line 178, in export_onnx
+    torch.onnx.export(
+    ~~~~~~~~~~~~~~~~~^
+        wrapper, (example,), str(path),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        opset_version=opset, dynamo=True, external_data=False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\__init__.py", line 291, in export
+    return _compat.export_compat(
+           ~~~~~~~~~~~~~~~~~~~~~^
+        model,
+        ^^^^^^
+    ...<18 lines>...
+        artifacts_dir=artifacts_dir,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_compat.py", line 161, in export_compat
+    onnx_program = _core.export(
+        model,
+    ...<13 lines>...
+        opset_version=opset_version,
+    )
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_core.py", line 1376, in export
+    result = strategy(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 129, in __call__
+    self._success(model)
+    ~~~~~~~~~~~~~^^^^^^^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 253, in _success
+    self._verbose_print(
+    ~~~~~~~~~~~~~~~~~~~^
+        f"Obtain model graph for `{model_repr}` with `torch.export.export(..., strict=False)`... \u2705"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 31, in <lambda>
+    return lambda *args, **kwargs: print("[torch.onnx]", *args, **kwargs)
+                                   ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 95: character maps to <undefined>
+
+======================================================================
+ERROR: setUpClass (tests.test_qdq_onnx.TestQDQGraph)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\U-net\tests\test_qdq_onnx.py", line 49, in setUpClass
+    cls.fp32 = export_onnx(cls.model, Path(cls.tmp.name) / "fp32.onnx", n_channels=3)
+               ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\U-net\quantization\export_onnx.py", line 178, in export_onnx
+    torch.onnx.export(
+    ~~~~~~~~~~~~~~~~~^
+        wrapper, (example,), str(path),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        opset_version=opset, dynamo=True, external_data=False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\__init__.py", line 291, in export
+    return _compat.export_compat(
+           ~~~~~~~~~~~~~~~~~~~~~^
+        model,
+        ^^^^^^
+    ...<18 lines>...
+        artifacts_dir=artifacts_dir,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_compat.py", line 161, in export_compat
+    onnx_program = _core.export(
+        model,
+    ...<13 lines>...
+        opset_version=opset_version,
+    )
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_core.py", line 1376, in export
+    result = strategy(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 129, in __call__
+    self._success(model)
+    ~~~~~~~~~~~~~^^^^^^^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 253, in _success
+    self._verbose_print(
+    ~~~~~~~~~~~~~~~~~~~^
+        f"Obtain model graph for `{model_repr}` with `torch.export.export(..., strict=False)`... \u2705"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 31, in <lambda>
+    return lambda *args, **kwargs: print("[torch.onnx]", *args, **kwargs)
+                                   ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 95: character maps to <undefined>
+
+======================================================================
+ERROR: setUpClass (tests.test_trt_engine.TestEngine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\U-net\tests\test_trt_engine.py", line 41, in setUpClass
+    onnx_path = export_onnx(cls.model, Path(cls.tmp.name) / "unet.onnx", n_channels=3)
+  File "D:\U-net\quantization\export_onnx.py", line 178, in export_onnx
+    torch.onnx.export(
+    ~~~~~~~~~~~~~~~~~^
+        wrapper, (example,), str(path),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        opset_version=opset, dynamo=True, external_data=False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\__init__.py", line 291, in export
+    return _compat.export_compat(
+           ~~~~~~~~~~~~~~~~~~~~~^
+        model,
+        ^^^^^^
+    ...<18 lines>...
+        artifacts_dir=artifacts_dir,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_compat.py", line 161, in export_compat
+    onnx_program = _core.export(
+        model,
+    ...<13 lines>...
+        opset_version=opset_version,
+    )
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_core.py", line 1376, in export
+    result = strategy(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 129, in __call__
+    self._success(model)
+    ~~~~~~~~~~~~~^^^^^^^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 253, in _success
+    self._verbose_print(
+    ~~~~~~~~~~~~~~~~~~~^
+        f"Obtain model graph for `{model_repr}` with `torch.export.export(..., strict=False)`... \u2705"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\U-net\venv\Lib\site-packages\torch\onnx\_internal\exporter\_capture_strategies.py", line 31, in <lambda>
+    return lambda *args, **kwargs: print("[torch.onnx]", *args, **kwargs)
+                                   ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ibarr\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 95: character maps to <undefined>
+
+----------------------------------------------------------------------
+Ran 58 tests in 4.859s
+
+FAILED (errors=5)
+[torch.onnx] Obtain model graph for `ExportableUNet([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] [torch.onnx] Obtain model graph for `ExportableUNet([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] [torch.onnx] Obtain model graph for `ExportableUNet([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] [torch.onnx] Obtain model graph for `ExportableUNet([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] [torch.onnx] Obtain model graph for `ExportableUNet([...]` with `torch.export.export(..., strict=False)`...
+[torch.onnx] 
